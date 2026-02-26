@@ -4,3 +4,4 @@ compatibility_date = "2024-02-01"
 
 [vars]
 SERVER_URL = ""
+WORKER_SECRET = ""

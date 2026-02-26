@@ -5,9 +5,13 @@ import path from "path";
 import crypto from "crypto";
 import { PassThrough, Readable } from "stream";
 
+if (!process.env.WORKER_SECRET) {
+  console.error("WORKER_SECRET is required");
+  process.exit(1);
+}
+
 const app = express();
 const port = process.env.PORT || 3000;
-
 const CACHE_DIR = path.resolve(process.cwd(), "cache");
 const MAX_CACHE_BYTES = 5 * 1024 * 1024 * 1024;
 const FORWARD_HEADER_KEYS = new Set([
@@ -20,6 +24,8 @@ const FORWARD_HEADER_KEYS = new Set([
   "etag",
   "last-modified"
 ]);
+const ALLOWED_WINDOW = 300;
+const WORKER_SECRET = process.env.WORKER_SECRET;
 
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
@@ -63,18 +69,14 @@ async function fetchStreamingInfo(id) {
   try {
     const info = await client.getInfo(id);
     if (info && info.streaming_data) return { streaming_data: info.streaming_data };
-  } catch (e) {
-    console.error("getInfo error:", e?.message || e);
-  }
+  } catch (e) {}
   try {
     const sd = await client.getStreamingData(id);
     if (sd) {
       const streaming_data = sd.formats || sd.adaptive_formats ? sd : { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
       return { streaming_data };
     }
-  } catch (e) {
-    console.error("getStreamingData error:", e?.message || e);
-  }
+  } catch (e) {}
   throw new Error("streaming data unavailable");
 }
 
@@ -111,13 +113,9 @@ async function enforceCacheLimit() {
         fs.unlinkSync(f.path);
         total -= f.size;
         if (total <= MAX_CACHE_BYTES) break;
-      } catch (e) {
-        console.error("prune error:", e);
-      }
+      } catch (e) {}
     }
-  } catch (e) {
-    console.error("enforceCacheLimit error:", e);
-  }
+  } catch (e) {}
 }
 
 const inProgress = new Map();
@@ -159,7 +157,7 @@ async function backgroundDownloadIfAbsent(key, url) {
     ]);
     try { ws.end(); } catch (e) {}
     if (fs.existsSync(tmpPath)) {
-      try { fs.renameSync(tmpPath, finalPath); } catch (e) { console.error("rename error:", e); }
+      try { fs.renameSync(tmpPath, finalPath); } catch (e) {}
       entry.resolve();
       inProgress.delete(key);
       await enforceCacheLimit();
@@ -170,11 +168,36 @@ async function backgroundDownloadIfAbsent(key, url) {
   } catch (e) {
     entry.reject(e);
     inProgress.delete(key);
-    console.error("backgroundDownload error:", e);
   }
 }
 
-app.get("/api/stream", async (req, res) => {
+function timingSafeEqualHex(aHex, bHex) {
+  try {
+    const a = Buffer.from(aHex, "hex");
+    const b = Buffer.from(bHex, "hex");
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch (e) {
+    return false;
+  }
+}
+
+function verifyWorkerAuth(req, res, next) {
+  if (req.method === "OPTIONS") return next();
+  const tsHeader = req.header("x-proxy-timestamp");
+  const sigHeader = req.header("x-proxy-signature");
+  if (!tsHeader || !sigHeader) return res.status(401).json({ error: "unauthorized" });
+  const ts = Number(tsHeader);
+  if (!Number.isFinite(ts)) return res.status(401).json({ error: "unauthorized" });
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - ts) > ALLOWED_WINDOW) return res.status(401).json({ error: "unauthorized" });
+  const payload = `${ts}:${req.originalUrl}`;
+  const expected = crypto.createHmac("sha256", WORKER_SECRET).update(payload).digest("hex");
+  if (!timingSafeEqualHex(expected, sigHeader)) return res.status(401).json({ error: "unauthorized" });
+  next();
+}
+
+app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
   try {
     const id = req.query.id;
     let itag = req.query.itag ? Number(req.query.itag) : null;
@@ -243,10 +266,9 @@ app.get("/api/stream", async (req, res) => {
         const upstreamStream = typeof upstream.body.pipe === "function" ? upstream.body : Readable.fromWeb(upstream.body);
         upstreamStream.on("error", () => { try { res.destroy(); } catch (e) {} });
         upstreamStream.pipe(res);
-        backgroundDownloadIfAbsent(key, url).catch(e => console.error("bg start error:", e));
+        backgroundDownloadIfAbsent(key, url).catch(e => {});
         return;
       } catch (e) {
-        console.error("range fetch error:", e);
         return res.status(502).json({ error: "upstream error" });
       }
     }
@@ -266,9 +288,7 @@ app.get("/api/stream", async (req, res) => {
         res.once("close", onClose);
         res.once("finish", onClose);
         return;
-      } catch (e) {
-        console.error("attach error:", e);
-      }
+      } catch (e) {}
     }
     const entry = {
       pass: new PassThrough(),
@@ -324,7 +344,7 @@ app.get("/api/stream", async (req, res) => {
       ]);
       try { writeStream.end(); } catch (e) {}
       if (fs.existsSync(tmpPath)) {
-        try { fs.renameSync(tmpPath, finalPath); } catch (e) { console.error("rename error:", e); }
+        try { fs.renameSync(tmpPath, finalPath); } catch (e) {}
         entry.resolve();
         inProgress.delete(key);
         await enforceCacheLimit();
@@ -334,7 +354,6 @@ app.get("/api/stream", async (req, res) => {
       }
       return;
     } catch (e) {
-      console.error("full fetch error:", e);
       try { entry.reject(e); } catch (_) {}
       inProgress.delete(key);
       return res.status(500).json({ error: String(e?.message || e) });
