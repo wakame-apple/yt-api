@@ -3,7 +3,7 @@ import { Innertube } from "youtubei.js";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { PassThrough } from "stream";
+import { PassThrough, Readable } from "stream";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -77,17 +77,12 @@ async function cleanCacheIfNeeded() {
   } catch (e) {}
 }
 
+let ytPromise = Innertube.create({ client_type: "ANDROID", generate_session_locally: true });
 let yt;
-(async () => {
-  try {
-    yt = await Innertube.create({
-      client_type: "ANDROID"
-    });
-  } catch (e) {
-    console.error("failed to initialize Innertube", e);
-    process.exit(1);
-  }
-})();
+async function getYT() {
+  if (!yt) yt = await ytPromise;
+  return yt;
+}
 
 function extractUrlFromFormat(format) {
   if (!format) return null;
@@ -108,17 +103,11 @@ async function getInfoCached(id) {
   const now = Date.now();
   const entry = infoCache.get(id);
   if (entry && entry.expires > now) return entry.value;
-
-  const sd = await yt.getStreamingData(id);
+  const ytClient = await getYT();
+  const sd = await ytClient.getStreamingData(id);
   if (!sd) throw new Error("getStreamingData returned empty");
-
-  const streaming_data =
-    sd.formats || sd.adaptive_formats
-      ? sd
-      : { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
-
+  const streaming_data = sd.formats || sd.adaptive_formats ? sd : { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
   const info = { streaming_data };
-
   infoCache.set(id, { value: info, expires: now + CACHE_TTL_MS });
   return info;
 }
@@ -133,8 +122,10 @@ app.get("/api/stream", async (req, res) => {
     const formats = [...(sd.formats || []), ...(sd.adaptive_formats || [])].filter(Boolean);
     if (!formats.length) return res.status(404).json({ error: "no formats" });
     if (!itag) {
+      const progressive = formats.find(f => (f.mime_type || f.mimeType || "").includes("video") && (f.audio_quality || f.audioBitrate || f.mime_type?.includes("audio") || f.has_audio));
       const nonDash = formats.find(f => f.itag === 22) || formats.find(f => f.itag === 18);
       if (nonDash) itag = nonDash.itag;
+      else if (progressive) itag = progressive.itag;
       else {
         const dashVideo = formats.find(f => f.mime_type && f.mime_type.includes("video")) || formats[0];
         itag = dashVideo.itag;
@@ -196,11 +187,20 @@ app.get("/api/stream", async (req, res) => {
       const upstreamHeaders = { Range: range };
       const gvRes = await fetch(url, { headers: upstreamHeaders });
       res.status(gvRes.status);
+      const forwardHeaders = {};
       for (const [k, v] of gvRes.headers) {
-        try { res.setHeader(k, v); } catch (e) {}
+        try {
+          const lk = k.toLowerCase();
+          if (FORWARD_HEADER_KEYS.has(lk)) {
+            forwardHeaders[lk] = v;
+            res.setHeader(lk, v);
+          }
+        } catch (e) {}
       }
-      gvRes.body.pipe(res);
-      gvRes.body.on("error", () => { try { res.destroy(); } catch (e) {} });
+      if (!gvRes.body) return res.status(502).json({ error: "no upstream body" });
+      const upstreamStream = typeof gvRes.body.pipe === "function" ? gvRes.body : Readable.fromWeb(gvRes.body);
+      upstreamStream.on("error", () => { try { res.destroy(); } catch (e) {} });
+      upstreamStream.pipe(res);
       return;
     }
     let resolveReady;
@@ -223,8 +223,10 @@ app.get("/api/stream", async (req, res) => {
     const gvRes = await fetch(url);
     const headersObj = {};
     for (const [k, v] of gvRes.headers) {
-      const lk = k.toLowerCase();
-      if (FORWARD_HEADER_KEYS.has(lk)) headersObj[lk] = v;
+      try {
+        const lk = k.toLowerCase();
+        if (FORWARD_HEADER_KEYS.has(lk)) headersObj[lk] = v;
+      } catch (e) {}
     }
     entry.headers = headersObj;
     entry.status = gvRes.status;
@@ -235,7 +237,14 @@ app.get("/api/stream", async (req, res) => {
       try { res.setHeader(k, v); } catch (e) {}
     }
     entry.clients.add(res);
-    gvRes.body.pipe(pass);
+    if (!gvRes.body) {
+      try { writeStream.destroy(); } catch (e) {}
+      try { if (fs.existsSync(tmpPathFile)) fs.unlinkSync(tmpPathFile); } catch (e) {}
+      inProgress.delete(key);
+      return res.status(502).json({ error: "no upstream body" });
+    }
+    const upstreamStream = typeof gvRes.body.pipe === "function" ? gvRes.body : Readable.fromWeb(gvRes.body);
+    upstreamStream.pipe(pass);
     pass.pipe(res);
     pass.pipe(writeStream);
     const onClientClose = () => {
@@ -244,7 +253,7 @@ app.get("/api/stream", async (req, res) => {
     };
     res.once("close", onClientClose);
     res.once("finish", onClientClose);
-    gvRes.body.on("end", async () => {
+    upstreamStream.on("end", async () => {
       try {
         try { writeStream.end(); } catch (e) {}
         if (fs.existsSync(tmpPathFile)) {
@@ -255,7 +264,7 @@ app.get("/api/stream", async (req, res) => {
         inProgress.delete(key);
       }
     });
-    gvRes.body.on("error", err => {
+    upstreamStream.on("error", err => {
       try { writeStream.destroy(); } catch (e) {}
       try { if (fs.existsSync(tmpPathFile)) fs.unlinkSync(tmpPathFile); } catch (e) {}
       entry.rejectReady(err);
