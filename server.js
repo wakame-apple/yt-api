@@ -108,18 +108,17 @@ async function getInfoCached(id) {
     if (cached === "NULL") throw new Error("video not found");
     try {
       return JSON.parse(cached);
-    } catch (e) {}
+    } catch {}
   }
   const ytClient = await getYT();
-  const sd = await ytClient.getStreamingData(id);
-  if (!sd) {
+  const info = await ytClient.getInfo(id);
+  if (!info?.streaming_data) {
     await redis.set(key, "NULL", "PX", 5 * 60 * 1000);
-    throw new Error("getStreamingData returned empty");
+    throw new Error("Streaming data not available");
   }
-  const streaming_data = sd.formats || sd.adaptive_formats ? sd : { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
-  const info = { streaming_data };
-  await redis.set(key, JSON.stringify(info), "PX", CACHE_TTL_MS);
-  return info;
+  const result = { streaming_data: info.streaming_data };
+  await redis.set(key, JSON.stringify(result), "PX", CACHE_TTL_MS);
+  return result;
 }
 
 async function acquireLock(key, ttlMs = 600000) {
