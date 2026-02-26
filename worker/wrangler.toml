@@ -1,4 +1,4 @@
-name = "yt-proxy"
+name = "yt-streamer-worker"
 main = "worker.js"
 compatibility_date = "2024-02-01"
 
