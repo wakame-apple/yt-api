@@ -269,7 +269,10 @@ app.get("/api/stream", async (req, res) => {
     });
     return;
   } catch (e) {
-    try { res.status(500).json({ error: "proxy error" }); } catch (e2) {}
+    console.error("STREAM ERROR:", e);
+    try {
+      res.status(500).json({ error: String(e?.message || e) });
+    } catch {}
   }
 });
 
