@@ -106,19 +106,35 @@ async function getInfoCached(id) {
   const cached = await redis.get(key);
   if (cached) {
     if (cached === "NULL") throw new Error("video not found");
-    try {
-      return JSON.parse(cached);
-    } catch {}
+    try { return JSON.parse(cached); } catch (e) {}
   }
   const ytClient = await getYT();
-  const info = await ytClient.getInfo(id);
-  if (!info?.streaming_data) {
-    await redis.set(key, "NULL", "PX", 5 * 60 * 1000);
-    throw new Error("Streaming data not available");
+
+  try {
+    const info = await ytClient.getInfo(id);
+    if (info && info.streaming_data) {
+      const result = { streaming_data: info.streaming_data };
+      await redis.set(key, JSON.stringify(result), "PX", CACHE_TTL_MS);
+      return result;
+    }
+  } catch (err) {
+    console.error("getInfo failed:", err && err.message ? err.message : err);
   }
-  const result = { streaming_data: info.streaming_data };
-  await redis.set(key, JSON.stringify(result), "PX", CACHE_TTL_MS);
-  return result;
+
+  try {
+    const sd = await ytClient.getStreamingData(id);
+    if (sd) {
+      const streaming_data = sd.formats || sd.adaptive_formats ? sd : { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
+      const result = { streaming_data };
+      await redis.set(key, JSON.stringify(result), "PX", CACHE_TTL_MS);
+      return result;
+    }
+  } catch (err) {
+    console.error("getStreamingData fallback failed:", err && err.message ? err.message : err);
+  }
+
+  await redis.set(key, "NULL", "PX", 5 * 60 * 1000);
+  throw new Error("Streaming data not available");
 }
 
 async function acquireLock(key, ttlMs = 600000) {
@@ -143,40 +159,27 @@ function waitForReadyFromRedis(key, timeoutMs = 30000) {
   const ch = redisChannel(key);
   return new Promise((resolve) => {
     let finished = false;
-    const cleanup = () => {
+    function cleanup() {
       try { redisSub.unsubscribe(ch); } catch (e) {}
       redisSub.removeListener("message", onMessage);
-    };
-    const onMessage = (_channel, message) => {
-      if (_channel !== ch) return;
+    }
+    function done(v) {
       if (finished) return;
       finished = true;
-      cleanup();
-      resolve(message === "ready");
-    };
-    redisSub.on("message", onMessage);
-    redisSub.subscribe(ch).catch(() => {
-      if (!finished) {
-        finished = true;
-        cleanup();
-        resolve(false);
-      }
-    });
-    const to = setTimeout(() => {
-      if (finished) return;
-      finished = true;
-      cleanup();
-      resolve(false);
-    }, timeoutMs);
-    const wrappedResolve = (v) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(to);
+      clearTimeout(timer);
       cleanup();
       resolve(v);
-    };
-    // in case subscribe failed synchronously
-    return;
+    }
+    function onMessage(channel, message) {
+      if (channel !== ch) return;
+      if (message === "ready") done(true);
+      else if (message === "error") done(false);
+    }
+    redisSub.on("message", onMessage);
+    redisSub.subscribe(ch).then(() => {
+      timer = setTimeout(() => done(false), timeoutMs);
+    }).catch(() => done(false));
+    let timer = setTimeout(() => done(false), timeoutMs);
   });
 }
 
