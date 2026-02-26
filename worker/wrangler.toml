@@ -3,4 +3,4 @@ main = "worker.js"
 compatibility_date = "2024-02-01"
 
 [vars]
-SERVER_URL = "https://your-node-server.com"
+SERVER_URL = ""
