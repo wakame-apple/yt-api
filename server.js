@@ -13,7 +13,7 @@ if (!process.env.WORKER_SECRET) {
 const app = express();
 const port = process.env.PORT || 3000;
 const CACHE_DIR = path.resolve(process.cwd(), "cache");
-const MAX_CACHE_BYTES = 5 * 1024 * 1024 * 1024;
+const MAX_CACHE_BYTES = 5 * 1024 * 1024 * 1024; // 5GB
 const FORWARD_HEADER_KEYS = new Set([
   "content-type",
   "content-length",
@@ -24,14 +24,13 @@ const FORWARD_HEADER_KEYS = new Set([
   "etag",
   "last-modified"
 ]);
-const ALLOWED_WINDOW = 300;
+const ALLOWED_WINDOW = 300; // seconds
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 let ytPromise = Innertube.create({ client_type: "ANDROID", generate_session_locally: true });
 let ytClient;
-
 async function getYtClient() {
   if (!ytClient) ytClient = await ytPromise;
   return ytClient;
@@ -40,14 +39,8 @@ async function getYtClient() {
 function sha1Key(id, itag) {
   return crypto.createHash("sha1").update(`${id}:${itag}`).digest("hex");
 }
-
-function filePathForKey(key) {
-  return path.join(CACHE_DIR, key);
-}
-
-function tmpPathForKey(key) {
-  return `${filePathForKey(key)}.tmp`;
-}
+function filePathForKey(key) { return path.join(CACHE_DIR, key); }
+function tmpPathForKey(key) { return `${filePathForKey(key)}.tmp`; }
 
 function parseSignatureUrl(format) {
   if (!format) return null;
@@ -57,8 +50,7 @@ function parseSignatureUrl(format) {
   try {
     const params = new URLSearchParams(sc);
     const u = params.get("url") || params.get("u");
-    if (!u) return null;
-    return decodeURIComponent(u);
+    return u || null;
   } catch (e) {
     return null;
   }
@@ -69,14 +61,19 @@ async function fetchStreamingInfo(id) {
   try {
     const info = await client.getInfo(id);
     if (info && info.streaming_data) return { streaming_data: info.streaming_data };
-  } catch (e) {}
+  } catch (e) {
+    // swallow — try fallback
+  }
   try {
     const sd = await client.getStreamingData(id);
     if (sd) {
-      const streaming_data = sd.formats || sd.adaptive_formats ? sd : { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
+      const streaming_data = (sd.formats || sd.adaptive_formats) ? sd
+        : { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
       return { streaming_data };
     }
-  } catch (e) {}
+  } catch (e) {
+    // final fail
+  }
   throw new Error("streaming data unavailable");
 }
 
@@ -113,9 +110,13 @@ async function enforceCacheLimit() {
         fs.unlinkSync(f.path);
         total -= f.size;
         if (total <= MAX_CACHE_BYTES) break;
-      } catch (e) {}
+      } catch (e) {
+        // ignore deletion errors
+      }
     }
-  } catch (e) {}
+  } catch (e) {
+    // ignore
+  }
 }
 
 const inProgress = new Map();
@@ -124,6 +125,7 @@ async function backgroundDownloadIfAbsent(key, url) {
   if (inProgress.has(key)) return;
   const tmpPath = tmpPathForKey(key);
   const finalPath = filePathForKey(key);
+
   const entry = {
     pass: new PassThrough(),
     tmpPath,
@@ -140,21 +142,24 @@ async function backgroundDownloadIfAbsent(key, url) {
   entry.resolve = resolveFn;
   entry.reject = rejectFn;
   inProgress.set(key, entry);
+
   try {
     const resp = await fetch(url);
-    if (!resp.body) {
-      entry.reject(new Error("no body"));
-      inProgress.delete(key);
-      return;
-    }
+    if (!resp.body) throw new Error("no body");
     const ws = fs.createWriteStream(tmpPath);
     const stream = typeof resp.body.pipe === "function" ? resp.body : Readable.fromWeb(resp.body);
+
+    stream.on("error", (e) => { try { ws.destroy(e); } catch (_) {} entry.reject(e); });
+    ws.on("error", (e) => { try { stream.destroy(e); } catch (_) {} entry.reject(e); });
+
     stream.pipe(entry.pass);
     stream.pipe(ws);
+
     await Promise.all([
       new Promise((r, j) => { stream.on("end", r); stream.on("error", j); }),
       new Promise((r, j) => { ws.on("finish", r); ws.on("error", j); })
     ]);
+
     try { ws.end(); } catch (e) {}
     if (fs.existsSync(tmpPath)) {
       try { fs.renameSync(tmpPath, finalPath); } catch (e) {}
@@ -186,14 +191,26 @@ function verifyWorkerAuth(req, res, next) {
   if (req.method === "OPTIONS") return next();
   const tsHeader = req.header("x-proxy-timestamp");
   const sigHeader = req.header("x-proxy-signature");
-  if (!tsHeader || !sigHeader) return res.status(401).json({ error: "unauthorized" });
+  if (!tsHeader || !sigHeader) {
+    console.error("auth failed: missing headers");
+    return res.status(401).json({ error: "unauthorized" });
+  }
   const ts = Number(tsHeader);
-  if (!Number.isFinite(ts)) return res.status(401).json({ error: "unauthorized" });
+  if (!Number.isFinite(ts)) {
+    console.error("auth failed: invalid timestamp header");
+    return res.status(401).json({ error: "unauthorized" });
+  }
   const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - ts) > ALLOWED_WINDOW) return res.status(401).json({ error: "unauthorized" });
-  const payload = `${ts}:${req.originalUrl}`;
+  if (Math.abs(now - ts) > ALLOWED_WINDOW) {
+    console.error("auth failed: timestamp outside allowed window");
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const payload = `${ts}:${req.originalUrl}`; // must match Worker payload
   const expected = crypto.createHmac("sha256", WORKER_SECRET).update(payload).digest("hex");
-  if (!timingSafeEqualHex(expected, sigHeader)) return res.status(401).json({ error: "unauthorized" });
+  if (!timingSafeEqualHex(expected, sigHeader)) {
+    console.error("auth failed: signature mismatch");
+    return res.status(401).json({ error: "unauthorized" });
+  }
   next();
 }
 
@@ -202,33 +219,40 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
     const id = req.query.id;
     let itag = req.query.itag ? Number(req.query.itag) : null;
     if (!id) return res.status(400).json({ error: "id required" });
+
     const info = await fetchStreamingInfo(id);
     const sd = info.streaming_data || {};
     const formats = [...(sd.formats || []), ...(sd.adaptive_formats || [])].filter(Boolean);
     if (!formats.length) return res.status(404).json({ error: "no formats" });
+
     if (!itag) {
-      const progressive = formats.find(f => (f.mime_type || f.mimeType || "").includes("video") && (f.audio_quality || f.audioBitrate || f.mime_type?.includes("audio") || f.has_audio));
+      const progressive = formats.find(f => (f.mime_type || f.mimeType || "").includes("video") &&
+        ((f.audio_quality || f.audioBitrate) || f.has_audio || (f.mime_type||"").includes("audio")));
       const nonDash = formats.find(f => f.itag === 22) || formats.find(f => f.itag === 18);
       if (nonDash) itag = nonDash.itag;
       else if (progressive) itag = progressive.itag;
       else {
-        const dashVideo = formats.find(f => f.mime_type && f.mime_type.includes("video")) || formats[0];
+        const dashVideo = formats.find(f => (f.mime_type || "").includes("video")) || formats[0];
         itag = dashVideo.itag;
       }
     }
+
     const format = formats.find(f => f.itag === itag);
     if (!format) return res.status(404).json({ error: "itag not found" });
+
     const url = parseSignatureUrl(format);
     const range = req.headers.range;
     const key = sha1Key(id, format.itag);
     const finalPath = filePathForKey(key);
     const tmpPath = tmpPathForKey(key);
+
     if (fs.existsSync(finalPath)) {
       const stat = fs.statSync(finalPath);
       const size = stat.size;
       res.setHeader("Accept-Ranges", "bytes");
       const contentType = (format.mime_type || format.mimeType || "").split(";")[0] || "application/octet-stream";
       res.setHeader("Content-Type", contentType);
+
       if (range) {
         const r = parseRangeHeader(range, size);
         if (!r) return res.status(416).setHeader("Content-Range", `bytes */${size}`).end();
@@ -237,41 +261,41 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
         res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
         res.setHeader("Content-Length", String(end - start + 1));
         const stream = fs.createReadStream(finalPath, { start, end });
+        stream.on("error", () => { try { res.destroy(); } catch (e) {} });
         stream.pipe(res);
         return;
       } else {
         res.setHeader("Content-Length", String(size));
         const stream = fs.createReadStream(finalPath);
+        stream.on("error", () => { try { res.destroy(); } catch (e) {} });
         stream.pipe(res);
         return;
       }
     }
+
     if (!url) return res.status(422).json({ error: "format has no direct url" });
+
     if (range) {
       try {
-        const upstreamHeaders = { Range: range };
-        const upstream = await fetch(url, { headers: upstreamHeaders });
+        const upstream = await fetch(url, { headers: { Range: range } });
         res.status(upstream.status);
-        const forwardHeaders = {};
         for (const [k, v] of upstream.headers) {
           try {
             const lk = k.toLowerCase();
-            if (FORWARD_HEADER_KEYS.has(lk)) {
-              forwardHeaders[lk] = v;
-              res.setHeader(lk, v);
-            }
+            if (FORWARD_HEADER_KEYS.has(lk)) res.setHeader(lk, v);
           } catch (e) {}
         }
         if (!upstream.body) return res.status(502).json({ error: "no upstream body" });
         const upstreamStream = typeof upstream.body.pipe === "function" ? upstream.body : Readable.fromWeb(upstream.body);
         upstreamStream.on("error", () => { try { res.destroy(); } catch (e) {} });
         upstreamStream.pipe(res);
-        backgroundDownloadIfAbsent(key, url).catch(e => {});
+        backgroundDownloadIfAbsent(key, url).catch(() => {});
         return;
       } catch (e) {
         return res.status(502).json({ error: "upstream error" });
       }
     }
+
     const ongoing = inProgress.get(key);
     if (ongoing) {
       try {
@@ -290,6 +314,7 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
         return;
       } catch (e) {}
     }
+
     const entry = {
       pass: new PassThrough(),
       tmpPath,
@@ -306,6 +331,7 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
     entry.resolve = resolveEntry;
     entry.reject = rejectEntry;
     inProgress.set(key, entry);
+
     try {
       const upstream = await fetch(url);
       if (!upstream.body) {
@@ -313,6 +339,7 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
         inProgress.delete(key);
         return res.status(502).json({ error: "no upstream body" });
       }
+
       const headersObj = {};
       for (const [k, v] of upstream.headers) {
         try {
@@ -322,6 +349,7 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
       }
       entry.headers = headersObj;
       entry.status = upstream.status;
+
       const writeStream = fs.createWriteStream(tmpPath);
       res.status(upstream.status);
       for (const [k, v] of Object.entries(headersObj)) {
@@ -329,19 +357,23 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
       }
       entry.clients.add(res);
       const stream = typeof upstream.body.pipe === "function" ? upstream.body : Readable.fromWeb(upstream.body);
+      stream.on("error", () => { try { entry.pass.destroy(); } catch (_) {} });
       stream.pipe(entry.pass);
       entry.pass.pipe(res);
       stream.pipe(writeStream);
+
       const onClientClose = () => {
         entry.clients.delete(res);
         try { entry.pass.unpipe(res); } catch (e) {}
       };
       res.once("close", onClientClose);
       res.once("finish", onClientClose);
+
       await Promise.all([
         new Promise((r, j) => { stream.on("end", r); stream.on("error", j); }),
         new Promise((r, j) => { writeStream.on("finish", r); writeStream.on("error", j); })
       ]);
+
       try { writeStream.end(); } catch (e) {}
       if (fs.existsSync(tmpPath)) {
         try { fs.renameSync(tmpPath, finalPath); } catch (e) {}
@@ -356,10 +388,12 @@ app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
     } catch (e) {
       try { entry.reject(e); } catch (_) {}
       inProgress.delete(key);
+      console.error("handler error:", String(e?.message || e));
       return res.status(500).json({ error: String(e?.message || e) });
     }
   } catch (e) {
     try { res.status(500).json({ error: String(e?.message || e) }); } catch {}
+    console.error("unexpected handler error:", String(e?.message || e));
   }
 });
 

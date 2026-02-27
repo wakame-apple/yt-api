@@ -1,12 +1,10 @@
 export default {
   async fetch(request, env) {
     const required = ["WORKER_SECRET", "SERVER_URL"];
-
     for (const key of required) {
-      if (!env[key]) {
-        return new Response(`${key} required`, { status: 500 });
-      }
+      if (!env[key]) return new Response(`${key} required`, { status: 500 });
     }
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -17,11 +15,14 @@ export default {
         }
       });
     }
+
     const url = new URL(request.url);
     const target = new URL(env.SERVER_URL);
     target.pathname = "/api/stream";
     target.search = url.search;
+
     const ts = Math.floor(Date.now() / 1000);
+
     async function hmacHex(secret, msg) {
       const enc = new TextEncoder();
       const keyData = enc.encode(secret);
@@ -35,15 +36,19 @@ export default {
       }
       return hex;
     }
-    const payload = `${ts}:${url.pathname}${url.search}`;
+
+    const payload = `${ts}:${target.pathname}${target.search}`;
     const signature = await hmacHex(env.WORKER_SECRET, payload);
+
     const outHeaders = new Headers(request.headers);
     outHeaders.set("x-proxy-timestamp", String(ts));
     outHeaders.set("x-proxy-signature", signature);
+
     const nodeRes = await fetch(target.toString(), {
       method: "GET",
       headers: outHeaders
     });
+
     const headers = new Headers(nodeRes.headers);
     headers.set("Access-Control-Allow-Origin", "*");
     headers.set("Access-Control-Allow-Headers", "*");
