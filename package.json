@@ -13,7 +13,7 @@
   "dependencies": {
     "express": "^4.19.0",
     "youtubei.js": "16.0.1",
-    "node-fetch": "^3.4.0",
-    "https-proxy-agent": "^6.0.0"
+    "undici-proxy-agent": "^2.0.0",
+    "undici": "^5.22.0"
   }
 }
