@@ -3,17 +3,19 @@ import { Innertube } from "youtubei.js";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import fetch from "node-fetch";
-import { HttpsProxyAgent } from "https-proxy-agent";
+import { fetch as undiciFetch, FormData, Headers, Request, Response } from "undici";
+import { ProxyAgent } from "undici-proxy-agent";
 import { PassThrough, Readable } from "stream";
 
 const PROXY = process.env.PROXY_URL || null;
-const proxyAgent = PROXY ? new HttpsProxyAgent(PROXY) : null;
+const proxyAgent = PROXY ? new ProxyAgent(PROXY) : null;
 
-async function proxyFetch(input, init = {}) {
+async function proxyFetch(input, init) {
   const opts = { ...(init || {}) };
-  if (proxyAgent) opts.agent = proxyAgent;
-  return fetch(input, opts);
+  if (proxyAgent) {
+    opts.dispatcher = proxyAgent;
+  }
+  return undiciFetch(input, opts);
 }
 
 if (!process.env.WORKER_SECRET) {
