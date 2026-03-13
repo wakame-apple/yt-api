@@ -4,18 +4,15 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import stream from "stream";
-import { pipeline } from "stream/promises";
-import { setTimeout as wait } from "timers/promises";
+
+const { pipeline } = stream.promises;
 
 const PORT = process.env.PORT || 3000;
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const UPSTREAM_TIMEOUT_MS = 30000; // 30s
-const INSTANCE_BAN_MS = 5 * 60 * 1000;
+const INSTANCE_BAN_MS = 5 * 60 * 1000);
 const ALLOWED_WINDOW = 300;
 const CACHE_DIR = path.join(process.cwd(), "cache");
-const INSTANCE_REFRESH_MS = 60 * 60 * 1000; // refresh every hour
-const MAX_INVIDIOUS_TRIES = 3;
-const MAX_PIPED_TRIES = 3;
 
 if (!WORKER_SECRET) {
   console.error("WORKER_SECRET is required");
@@ -56,7 +53,7 @@ const PIPED_INSTANCES = [
   "https://pipedapi.orangenet.cc",
 ];
 
-// -------------------- innertube client --------------------
+// ---------- Innertube client ----------
 let ytPromise = Innertube.create({ client_type: "ANDROID", generate_session_locally: true });
 let ytClient;
 async function getYtClient() {
@@ -64,9 +61,10 @@ async function getYtClient() {
   return ytClient;
 }
 
-// -------------------- instance management --------------------
+// ---------- instance management ----------
 const badInstances = new Map(); // instance -> timestamp when marked bad
 const nextIndex = { invidious: 0, piped: 0 };
+
 function markBad(instance) {
   try { badInstances.set(instance, Date.now()); console.warn("[INST] mark bad", instance); } catch {}
 }
@@ -76,59 +74,29 @@ function isBad(instance) {
   if (Date.now() - t > INSTANCE_BAN_MS) { badInstances.delete(instance); return false; }
   return true;
 }
+
+/*
+  Return a rotated array of instances starting from nextIndex[providerKey],
+  filtered to exclude currently-bad instances. The returned array contains
+  each instance at most once (no duplicates).
+*/
 function getInstancesForProvider(list, providerKey) {
   if (!Array.isArray(list) || list.length === 0) return [];
-  const idx = (nextIndex[providerKey] || 0) % list.length;
-  nextIndex[providerKey] = (idx + 1) % list.length;
-  const rotated = [...list.slice(idx), ...list.slice(0, idx)];
+  const len = list.length;
+  const start = nextIndex[providerKey] % len;
+  const rotated = [];
+  for (let i = 0; i < len; i++) {
+    const idx = (start + i) % len;
+    rotated.push(list[idx]);
+  }
+  // advance pointer so next call starts after this rotation (prevents bias)
+  nextIndex[providerKey] = (start + 1) % len;
+  // filter bad ones for this run (but if all bad, return rotated so fallback tries them)
   const good = rotated.filter(i => !isBad(i));
   return good.length ? good : rotated;
 }
 
-// Periodically attempt to refresh instance lists from optional endpoints provided via env vars.
-// These URLs are optional and best-effort: they are attempted but failure doesn't break server.
-async function tryRefreshInstances() {
-  try {
-    // Example: INVIDIOUS_LIST_URL can point to a JSON array of instances
-    if (process.env.INVIDIOUS_LIST_URL) {
-      try {
-        const res = await fetch(process.env.INVIDIOUS_LIST_URL, { method: "GET", timeout: UPSTREAM_TIMEOUT_MS });
-        if (res.ok) {
-          const j = await res.json();
-          if (Array.isArray(j) && j.length) {
-            INVIDIOUS_INSTANCES = j;
-            console.info("[INST] refreshed Invidious instances from", process.env.INVIDIOUS_LIST_URL);
-          }
-        }
-      } catch (e) {
-        console.warn("[INST] failed to fetch INVIDIOUS_LIST_URL", e?.message || e);
-      }
-    }
-    if (process.env.PIPED_LIST_URL) {
-      try {
-        const res = await fetch(process.env.PIPED_LIST_URL, { method: "GET", timeout: UPSTREAM_TIMEOUT_MS });
-        if (res.ok) {
-          const j = await res.json();
-          if (Array.isArray(j) && j.length) {
-            PIPED_INSTANCES = j;
-            console.info("[INST] refreshed Piped instances from", process.env.PIPED_LIST_URL);
-          }
-        }
-      } catch (e) {
-        console.warn("[INST] failed to fetch PIPED_LIST_URL", e?.message || e);
-      }
-    }
-  } catch (e) {
-    console.warn("[INST] tryRefreshInstances error", e?.message || e);
-  } finally {
-    // schedule next
-    setTimeout(tryRefreshInstances, INSTANCE_REFRESH_MS).unref();
-  }
-}
-// start background refresh
-setTimeout(tryRefreshInstances, 5_000).unref();
-
-// -------------------- utilities --------------------
+// ---------- utilities ----------
 function parseSignatureUrl(format) {
   if (!format) return null;
   if (format.url) return format.url;
@@ -149,23 +117,20 @@ function selectBestProgressive(formats) {
     bitrate: Number(f.bitrate || f.audioBitrate || 0) || 0
   }));
 
-  // 1) combined audio+video (progressive)
   const combined = norm.filter(f => f.url && f.has_audio && /video/.test(f.mime || "video"));
   if (combined.length) { combined.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate)); return combined[0].original; }
 
-  // 2) codecs suggesting combined
   const codecsCombined = norm.filter(f => f.url && /mp4a|aac|opus|vorbis/.test(f.mime));
   if (codecsCombined.length) { codecsCombined.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate)); return codecsCombined[0].original; }
 
-  // 3) any video
   const videos = norm.filter(f => f.url && /video/.test(f.mime || ""));
   if (videos.length) { videos.sort((a,b) => (b.height - a.height) || (b.bitrate - a.bitrate)); return videos[0].original; }
 
-  // 4) any URL
   const any = norm.find(f => f.url);
   return any ? any.original : null;
 }
 
+// fetch with explicit timeout using AbortController
 async function fetchWithTimeout(url, opts = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
@@ -176,35 +141,66 @@ async function fetchWithTimeout(url, opts = {}) {
   } catch (e) { clearTimeout(timeout); throw e; }
 }
 
-// -------------------- provider fetchers (Invidious → Piped → Innertube) --------------------
+// ---------- memory cache for provider URLs ----------
+// key: `${id}:${itag || 'best'}`
+// value: { url, provider, instance (if applicable), expiresAt (ms epoch) }
+const providerUrlCache = new Map();
+
+function setProviderUrlCache(key, value) {
+  providerUrlCache.set(key, value);
+}
+function getProviderUrlCache(key) {
+  const v = providerUrlCache.get(key);
+  if (!v) return null;
+  if (v.expiresAt && Date.now() > v.expiresAt) { providerUrlCache.delete(key); return null; }
+  return v;
+}
+
+// derive expiresAt from url expire param if possible; otherwise use default TTL
+function computeExpiresAtFromUrl(url, defaultSeconds = 300) {
+  try {
+    const u = new URL(url);
+    const expire = u.searchParams.get("expire");
+    if (expire) {
+      const epoch = Number(expire) * 1000;
+      if (Number.isFinite(epoch) && epoch > Date.now()) {
+        return epoch - 5000; // 5s safety margin
+      }
+    }
+  } catch (e) {}
+  return Date.now() + defaultSeconds * 1000;
+}
+
+// ---------- provider fetchers (each tries each instance ONCE per call; no duplicates) ----------
+
 async function fetchFromInvidious(id) {
   const instances = getInstancesForProvider(INVIDIOUS_INSTANCES, "invidious");
   if (!instances.length) throw new Error("no invidious instances configured");
   let lastErr = null;
   for (const base of instances) {
-    for (let attempt = 0; attempt < MAX_INVIDIOUS_TRIES; attempt++) {
-      try {
-        const url = `${base.replace(/\/$/, "")}/api/v1/videos/${id}`;
-        console.info("[INV] trying", base, "attempt", attempt + 1);
-        let resp;
-        try { resp = await fetchWithTimeout(url); } catch (e) { console.warn("[INV] fetch fail", base, e?.message || e); markBad(base); lastErr = e; continue; }
-        console.info("[INV] status", base, resp.status);
-        if (!resp.ok) { markBad(base); lastErr = new Error(`status ${resp.status}`); continue; }
-        const data = await resp.json();
-        const formats = [];
-        if (Array.isArray(data.formatStreams)) for (const f of data.formatStreams) formats.push({ itag: f.itag, url: f.url, mime_type: f.type, ...f });
-        if (Array.isArray(data.adaptiveFormats)) for (const f of data.adaptiveFormats) formats.push({ itag: f.itag, url: f.url, mime_type: f.type, ...f });
-        if (Array.isArray(data.formats)) for (const f of data.formats) formats.push({ itag: f.itag, url: f.url, mime_type: f.mimeType || f.type, ...f });
-        console.info("[INV] formats found", base, formats.length);
-        if (formats.length) return { provider: "invidious", streaming_data: { formats, adaptive_formats: [] } , rawProviderData: data };
-        // if no formats, mark bad (the instance didn't supply usable data)
-        console.warn("[INV] no formats from", base);
-        markBad(base);
-      } catch (e) {
-        console.warn("[INV] exception for", base, e?.message || e);
-        markBad(base);
-        lastErr = e;
+    try {
+      const url = `${base.replace(/\/$/, "")}/api/v1/videos/${id}`;
+      console.info("[INV] trying", base);
+      let resp;
+      try { resp = await fetchWithTimeout(url, { headers: { "user-agent": "node-fetch" } }); } catch (e) { console.warn("[INV] fetch fail", base, e?.message || e); markBad(base); lastErr = e; continue; }
+      console.info("[INV] status", base, resp.status);
+      if (!resp.ok) { markBad(base); lastErr = new Error(`status ${resp.status}`); continue; }
+      const data = await resp.json();
+      const formats = [];
+      if (Array.isArray(data.formatStreams)) for (const f of data.formatStreams) formats.push({ itag: f.itag, url: f.url, mime_type: f.type, ...f });
+      if (Array.isArray(data.adaptiveFormats)) for (const f of data.adaptiveFormats) formats.push({ itag: f.itag, url: f.url, mime_type: f.type, ...f });
+      if (Array.isArray(data.formats)) for (const f of data.formats) formats.push({ itag: f.itag, url: f.url, mime_type: f.mimeType || f.type, ...f });
+      console.info("[INV] formats found", base, formats.length);
+      if (formats.length) {
+        // return instance used (so we can build provider proxy endpoint)
+        return { provider: "invidious", instance: base, streaming_data: { formats, adaptive_formats: [] }, rawProviderData: data };
       }
+      console.warn("[INV] no formats from", base);
+      markBad(base);
+    } catch (e) {
+      console.warn("[INV] exception for", base, e?.message || e);
+      markBad(base);
+      lastErr = e;
     }
   }
   throw lastErr || new Error("invidious all instances failed");
@@ -215,28 +211,28 @@ async function fetchFromPiped(id) {
   if (!instances.length) throw new Error("no piped instances configured");
   let lastErr = null;
   for (const base of instances) {
-    for (let attempt = 0; attempt < MAX_PIPED_TRIES; attempt++) {
-      try {
-        const url = `${base.replace(/\/$/, "")}/streams/${id}`;
-        console.info("[PIPED] trying", base, "attempt", attempt+1);
-        let resp;
-        try { resp = await fetchWithTimeout(url); } catch (e) { console.warn("[PIPED] fetch fail", base, e?.message || e); markBad(base); lastErr = e; continue; }
-        console.info("[PIPED] status", base, resp.status);
-        if (!resp.ok) { markBad(base); lastErr = new Error(`status ${resp.status}`); continue; }
-        const data = await resp.json();
-        const formats = [];
-        if (Array.isArray(data.videoStreams)) for (const v of data.videoStreams) formats.push({ itag: v.itag, url: v.url, mime_type: v.mimeType || v.type, ...v });
-        if (Array.isArray(data.audioStreams)) for (const a of data.audioStreams) formats.push({ itag: a.itag, url: a.url, mime_type: a.mimeType || a.type, ...a });
-        if (Array.isArray(data.formats)) for (const f of data.formats) formats.push({ itag: f.itag, url: f.url, mime_type: f.mimeType || f.type, ...f });
-        console.info("[PIPED] formats found", base, formats.length);
-        if (formats.length) return { provider: "piped", streaming_data: { formats, adaptive_formats: [] }, rawProviderData: data };
-        console.warn("[PIPED] no formats from", base);
-        markBad(base);
-      } catch (e) {
-        console.warn("[PIPED] exception for", base, e?.message || e);
-        markBad(base);
-        lastErr = e;
+    try {
+      const url = `${base.replace(/\/$/, "")}/streams/${id}`;
+      console.info("[PIPED] trying", base);
+      let resp;
+      try { resp = await fetchWithTimeout(url, { headers: { "user-agent": "node-fetch" } }); } catch (e) { console.warn("[PIPED] fetch fail", base, e?.message || e); markBad(base); lastErr = e; continue; }
+      console.info("[PIPED] status", base, resp.status);
+      if (!resp.ok) { markBad(base); lastErr = new Error(`status ${resp.status}`); continue; }
+      const data = await resp.json();
+      const formats = [];
+      if (Array.isArray(data.videoStreams)) for (const v of data.videoStreams) formats.push({ itag: v.itag, url: v.url, mime_type: v.mimeType || v.type, ...v });
+      if (Array.isArray(data.audioStreams)) for (const a of data.audioStreams) formats.push({ itag: a.itag, url: a.url, mime_type: a.mimeType || a.type, ...a });
+      if (Array.isArray(data.formats)) for (const f of data.formats) formats.push({ itag: f.itag, url: f.url, mime_type: f.mimeType || f.type, ...f });
+      console.info("[PIPED] formats found", base, formats.length);
+      if (formats.length) {
+        return { provider: "piped", instance: base, streaming_data: { formats, adaptive_formats: [] }, rawProviderData: data };
       }
+      console.warn("[PIPED] no formats from", base);
+      markBad(base);
+    } catch (e) {
+      console.warn("[PIPED] exception for", base, e?.message || e);
+      markBad(base);
+      lastErr = e;
     }
   }
   throw lastErr || new Error("piped all instances failed");
@@ -261,19 +257,19 @@ async function fetchFromInnertube(id) {
   throw new Error("innertube streaming data unavailable");
 }
 
-// Keep the requested order: Invidious -> Piped -> Innertube
+// Keep order Invidious -> Piped -> Innertube
 async function fetchStreamingInfo(id) {
   console.info("[FLOW] fetchStreamingInfo", id);
   try {
     const r = await fetchFromInvidious(id);
-    console.info("[FLOW] selected invidious");
+    console.info("[FLOW] selected invidious", r.instance);
     return r;
   } catch (e) {
     console.warn("[FLOW] Invidious failed:", e?.message || e);
   }
   try {
     const r = await fetchFromPiped(id);
-    console.info("[FLOW] selected piped");
+    console.info("[FLOW] selected piped", r.instance);
     return r;
   } catch (e) {
     console.warn("[FLOW] Piped failed:", e?.message || e);
@@ -282,7 +278,7 @@ async function fetchStreamingInfo(id) {
   return await fetchFromInnertube(id);
 }
 
-// -------------------- Security (HMAC + timestamp) --------------------
+// ---------- Security ----------
 function timingSafeEqualHex(aHex, bHex) {
   try { const a = Buffer.from(aHex, "hex"); const b = Buffer.from(bHex, "hex"); if (a.length !== b.length) return false; return crypto.timingSafeEqual(a, b); } catch { return false; }
 }
@@ -301,13 +297,10 @@ function verifyWorkerAuth(req, res, next) {
   next();
 }
 
-// -------------------- Active stream tracking (dedupe simultaneous downloads) --------------------
-/*
-  activeMp4Streams: key = `${id}:${itag || 'best'}`, value =
-    { pass: PassThrough, clients: Set(res), writePromise: Promise, finished: boolean }
-*/
-const activeMp4Streams = new Map();
+// ---------- Active stream tracking ----------
+const activeMp4Streams = new Map(); // key -> { pass, clients: Set(res) }
 
+// ---------- file paths ----------
 function makeCachePaths(id, itag) {
   const dir = path.join(CACHE_DIR, id);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -316,17 +309,56 @@ function makeCachePaths(id, itag) {
   return { dir, file, tmp };
 }
 
-// robust stream + cache writer
+// Build Invidious proxy URL (most Invidious instances expose /api/v1/proxy)
+function buildInvidiousProxy(instance, videoId, itag) {
+  return `${instance.replace(/\/$/, "")}/api/v1/proxy?v=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(itag)}`;
+}
+
+// Build candidate Piped proxy URLs. Different Piped instances expose different proxies;
+// try a couple of likely endpoints. The function returns array of candidate proxy URLs.
+function buildPipedProxyCandidates(instance, rawUrl) {
+  const base = instance.replace(/\/$/, "");
+  try {
+    const u = new URL(rawUrl);
+    const host = u.host;
+    const pathAndQuery = u.pathname + u.search;
+    // candidate 1: path-host style
+    const c1 = `${base}/proxy/videoplayback?host=${encodeURIComponent(host)}&path=${encodeURIComponent(pathAndQuery)}`;
+    // candidate 2: simple wrapper with url param
+    const c2 = `${base}/proxy?url=${encodeURIComponent(rawUrl)}`;
+    // candidate 3: proxy/videoplayback with encoded full url
+    const c3 = `${base}/proxy/videoplayback?url=${encodeURIComponent(rawUrl)}`;
+    return [c1, c2, c3];
+  } catch (e) {
+    return [`${base}/proxy?url=${encodeURIComponent(rawUrl)}`];
+  }
+}
+
+// Test candidate proxy URLs (HEAD) and return first that responds ok (200/206)
+// If none ok, return null.
+async function chooseWorkingProxy(candidateUrls) {
+  for (const p of candidateUrls) {
+    try {
+      const head = await fetchWithTimeout(p, { method: "HEAD", headers: { "user-agent": "node-fetch" } });
+      if (head && (head.status === 200 || head.status === 206)) {
+        return p;
+      }
+    } catch (e) {
+      // ignore and try next
+    }
+  }
+  return null;
+}
+
+// Core: stream from an upstream URL (which may be provider proxy url or googlevideo url) and cache to disk,
+// while piping to clients. Dedupe concurrent downloads by key (id:itag)
 async function streamAndCacheMp4(videoUrl, cacheFile, req, res, key) {
-  // key used for activeMp4Streams
   const id = path.basename(path.dirname(cacheFile));
-  // If another stream active for same key, join it
   if (activeMp4Streams.has(key)) {
     const state = activeMp4Streams.get(key);
     state.clients.add(res);
     req.on('close', () => state.clients.delete(res));
-    console.info("[STREAM] joined existing active stream", key, "clients", state.clients.size);
-    // Set headers for this client (best-effort)
+    console.info("[STREAM] joined existing", key, "clients", state.clients.size);
     return;
   }
 
@@ -338,8 +370,11 @@ async function streamAndCacheMp4(videoUrl, cacheFile, req, res, key) {
 
   const writeStream = fs.createWriteStream(tmp, { flags: 'a' });
 
-  // prepare headers for upstream; forward range if present
-  const headers = {};
+  const headers = {
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "accept": "*/*",
+    "referer": "https://www.youtube.com/"
+  };
   if (req.headers.range) headers.Range = req.headers.range;
 
   let upstream;
@@ -362,7 +397,6 @@ async function streamAndCacheMp4(videoUrl, cacheFile, req, res, key) {
     return;
   }
 
-  // headers
   const contentType = upstream.headers.get('content-type') || 'video/mp4';
   const contentLength = upstream.headers.get('content-length');
   const contentRange = upstream.headers.get('content-range');
@@ -374,41 +408,25 @@ async function streamAndCacheMp4(videoUrl, cacheFile, req, res, key) {
       if (contentRange) r.setHeader('Content-Range', contentRange);
       r.setHeader('Accept-Ranges', 'bytes');
       if (req.headers.range) r.status(206);
-    } catch (e) { /* ignore */ }
+    } catch (e) {}
   };
 
-  // set headers for current client
-  setHeadersFor(res);
-
-  // ensure each client gets the headers and data
   for (const c of clients) setHeadersFor(c);
 
-  // pipe upstream -> pass -> writeFile and -> clients
   const upstreamStream = upstream.body;
-
-  // Important: pipe upstream to pass; we then pipe pass to file and every client.
   upstreamStream.pipe(pass);
   pass.pipe(writeStream);
 
   const pipeToClients = () => {
     for (const c of clients) {
       if (c.writableEnded) continue;
-      try {
-        // each client needs its own piping from pass
-        pass.pipe(c, { end: false });
-      } catch (e) {
-        console.warn("[STREAM] pipe error to client", e?.message || e);
-      }
+      try { pass.pipe(c, { end: false }); } catch (e) { console.warn("[STREAM] pipe error to client", e?.message || e); }
     }
   };
   pipeToClients();
 
   upstreamStream.on('end', () => {
-    try {
-      writeStream.close();
-      // rename tmp -> final (best-effort)
-      try { fs.renameSync(tmp, cacheFile); } catch (err) { console.warn("[STREAM] rename failed", err?.message || err); }
-    } catch (e) { console.warn("[STREAM] onend cleanup", e?.message || e); }
+    try { writeStream.close(); fs.renameSync(tmp, cacheFile); } catch (e) { console.warn("[STREAM] finalize failed", e?.message || e); }
     for (const c of clients) try { if (!c.writableEnded) c.end(); } catch {}
     state.finished = true;
     activeMp4Streams.delete(key);
@@ -422,13 +440,10 @@ async function streamAndCacheMp4(videoUrl, cacheFile, req, res, key) {
     console.error("[STREAM] upstream error", err?.message || err);
   });
 
-  // remove client on disconnect
-  req.on('close', () => {
-    clients.delete(res);
-  });
+  req.on('close', () => clients.delete(res));
 }
 
-// serve from cache with correct Range handling
+// serve from cache with Range support
 function streamFromCache(cacheFile, req, res) {
   const stat = fs.statSync(cacheFile);
   const range = req.headers.range;
@@ -446,24 +461,21 @@ function streamFromCache(cacheFile, req, res) {
   fs.createReadStream(cacheFile, { start, end }).pipe(res);
 }
 
-// -------------------- API: /api/stream --------------------
+// ---------- API: /api/stream ----------
+// Behavior:
+// 1) Check providerUrlCache for id:itag; if present & valid, use cached URL (ensures same url used).
+// 2) Otherwise call fetchStreamingInfo (Invidious -> Piped -> Innertube).
+// 3) If provider is Invidious: build provider proxy URL (instance/api/v1/proxy?v=..&itag=..), store it in memory with TTL based on expire param.
+//    If provider is Piped: try to find working piped proxy endpoint for the provider's raw url; if found, store and use it.
+//    If provider is Innertube: raw googlevideo URL returned — store and use it (may be IP-free or IP-bound).
 app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
   try {
     const id = req.query.id;
     if (!id) return res.status(400).json({ error: 'id required' });
 
-    const base = path.join(CACHE_DIR, id);
-    if (!fs.existsSync(base)) fs.mkdirSync(base, { recursive: true });
-
-    // We'll choose an itag-specific file name; if not found pick best => 'best.mp4'
-    // For simplicity: choose the "chosen" format's itag or "best"
+    // attempt to fetch streaming info and possibly cached provider URL
     let info;
-    try {
-      info = await fetchStreamingInfo(id);
-    } catch (e) {
-      console.error("[API] fetchStreamingInfo failed", e?.message || e);
-      return res.status(502).json({ error: 'no streaming info' });
-    }
+    try { info = await fetchStreamingInfo(id); } catch (e) { console.error("[API] fetchStreamingInfo failed", e?.message || e); return res.status(502).json({ error: 'no streaming info' }); }
 
     const sd = info.streaming_data || {};
     const formats = [...(sd.formats || []), ...(sd.adaptive_formats || [])].filter(Boolean);
@@ -472,46 +484,90 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
     if (!formats.length) return res.status(404).json({ error: 'no formats' });
 
     const chosen = selectBestProgressive(formats);
-    if (!chosen) {
-      console.warn("[API] no suitable progressive format");
-      return res.status(404).json({ error: 'no suitable format' });
-    }
-
-    const rawUrl = parseSignatureUrl(chosen) || chosen.url;
-    if (!rawUrl) {
-      console.warn("[API] chosen format has no direct url");
-      return res.status(422).json({ error: 'format has no direct url' });
-    }
-
-    // Log if ip= or ipbits= present in URL (possible IP-bound url)
-    try {
-      const u = new URL(rawUrl);
-      if (u.searchParams.has('ip') || u.searchParams.has('ipbits')) {
-        console.warn("[API] url contains ip/ipbits — may be IP-bound", { ip: u.searchParams.get('ip'), ipbits: u.searchParams.get('ipbits') });
-      }
-      if (u.searchParams.has('expire')) {
-        console.info("[API] url expire at (epoch)", u.searchParams.get('expire'));
-      }
-    } catch (e) {
-      // ignore
-    }
+    if (!chosen) return res.status(404).json({ error: 'no suitable format' });
 
     const chosenItag = chosen.itag || chosen.itagNo || "best";
-    const cacheFile = path.join(base, `${chosenItag}.mp4`);
+    const cacheKey = `${id}:${chosenItag}`;
+    // 1) check memory cache for provider URL
+    const cached = getProviderUrlCache(cacheKey);
+    if (cached) {
+      console.info("[API] using cached provider URL", cacheKey, cached.provider, cached.url.slice(0,120));
+      // serve from cache file if exists
+      const { file: cacheFile } = makeCachePaths(id, chosenItag);
+      if (fs.existsSync(cacheFile)) return streamFromCache(cacheFile, req, res);
+      // otherwise stream from cached provider URL (same URL as retrieved earlier)
+      return await streamAndCacheMp4(cached.url, cacheFile, req, res, cacheKey);
+    }
 
-    // if fully cached already => serve from file
+    // 2) determine rawUrl from chosen format
+    const rawUrl = parseSignatureUrl(chosen) || chosen.url;
+    if (!rawUrl) return res.status(422).json({ error: 'format has no direct url' });
+
+    // attempt to compute provider-specific proxy URL that will be stable for re-use:
+    let finalUrl = null;
+    let finalProvider = info.provider;
+    let finalInstance = info.instance || null;
+
+    if (info.provider === "invidious" && info.instance) {
+      // build Invidious proxy endpoint for exact itag — this will give us a URL served by the Invidious instance itself,
+      // so client's IP mismatch issues go away when we fetch through that instance.
+      try {
+        finalUrl = buildInvidiousProxy(info.instance, id, chosenItag);
+        finalProvider = "invidious-proxy";
+        finalInstance = info.instance;
+        console.info("[API] built invidious proxy url", finalUrl);
+      } catch (e) {
+        console.warn("[API] failed to build invidious proxy", e?.message || e);
+      }
+    }
+
+    if (!finalUrl && info.provider === "piped" && info.instance) {
+      // try to find a working piped proxy wrapper for the raw googlevideo URL.
+      try {
+        const candidates = buildPipedProxyCandidates(info.instance, rawUrl);
+        const ok = await chooseWorkingProxy(candidates);
+        if (ok) {
+          finalUrl = ok;
+          finalProvider = "piped-proxy";
+          finalInstance = info.instance;
+          console.info("[API] chosen piped proxy", ok);
+        } else {
+          console.warn("[API] no working piped proxy found; will try raw url");
+        }
+      } catch (e) {
+        console.warn("[API] piped proxy detection error", e?.message || e);
+      }
+    }
+
+    // If we couldn't build provider proxy URL, fall back to using the rawUrl returned by provider/Innertube.
+    if (!finalUrl) {
+      finalUrl = rawUrl;
+      finalProvider = info.provider || "unknown";
+      console.info("[API] using raw url from provider", finalProvider, rawUrl.slice(0,120));
+    }
+
+    // store in memory cache with TTL from expire param if present
+    const expiresAt = computeExpiresAtFromUrl(finalUrl, 300); // default 300s
+    setProviderUrlCache(cacheKey, { url: finalUrl, provider: finalProvider, instance: finalInstance, expiresAt });
+    console.info("[API] cached provider url", cacheKey, "expiresAt", new Date(expiresAt).toISOString());
+
+    // serve from disk if cached file exists (itag-specific)
+    const { file: cacheFile } = makeCachePaths(id, chosenItag);
     if (fs.existsSync(cacheFile)) {
-      console.info("[API] serving from cache", cacheFile);
+      console.info("[API] serving existing cache", cacheFile);
       return streamFromCache(cacheFile, req, res);
     }
 
-    // otherwise start streaming+cache; key for dedupe is id+itag
-    const key = `${id}:${chosenItag}`;
-    await streamAndCacheMp4(rawUrl, cacheFile, req, res, key);
+    // stream from finalUrl and cache
+    await streamAndCacheMp4(finalUrl, cacheFile, req, res, cacheKey);
+
   } catch (e) {
     console.error("[API] unexpected", e?.message || e);
     return res.status(500).json({ error: String(e) });
   }
 });
+
+// health check
+app.get('/healthz', (req, res) => res.json({ ok: true, now: Date.now() }));
 
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
