@@ -2,20 +2,25 @@ import express from "express";
 import { Innertube } from "youtubei.js";
 import crypto from "crypto";
 
-const app = express();
-const port = process.env.PORT || 3000;
+/* -------------------------------------------------- */
+/* Config */
+/* -------------------------------------------------- */
 
-const WORKER_SECRET = process.env.WORKER_SECRET;
+const PORT = process.env.PORT || 3000;
 
-if (!WORKER_SECRET) {
-  console.error("WORKER_SECRET required");
+if (!process.env.WORKER_SECRET) {
+  console.error("WORKER_SECRET is required");
   process.exit(1);
 }
 
-const ALLOWED_WINDOW = 300;
-const INSTANCE_BAN_MS = 300000;
+const WORKER_SECRET = process.env.WORKER_SECRET;
 
-/* ---------------- Instances ---------------- */
+const ALLOWED_WINDOW = 300;
+const INSTANCE_BAN_MS = 5 * 60 * 1000;
+
+/* -------------------------------------------------- */
+/* Instances */
+/* -------------------------------------------------- */
 
 const INVIDIOUS_INSTANCES = [
   "https://inv.nadeko.net",
@@ -25,7 +30,7 @@ const INVIDIOUS_INSTANCES = [
   "https://yt.omada.cafe",
   "https://invidious.nerdvpn.de",
   "https://invidious.tiekoetter.com",
-  "https://yewtu.be",
+  "https://yewtu.be"
 ];
 
 const PIPED_INSTANCES = [
@@ -43,414 +48,398 @@ const PIPED_INSTANCES = [
   "https://pipedapi.reallyaweso.me",
   "https://api.piped.private.coffee",
   "https://pipedapi.darkness.services",
-  "https://pipedapi.orangenet.cc",
+  "https://pipedapi.orangenet.cc"
 ];
 
-/* ---------------- Health ---------------- */
+/* -------------------------------------------------- */
+/* Express */
+/* -------------------------------------------------- */
 
-const bad = new Map();
+const app = express();
 
-function markBad(url){
-  bad.set(url,Date.now());
+/* -------------------------------------------------- */
+/* Innertube */
+/* -------------------------------------------------- */
+
+let ytClient;
+
+async function getYtClient() {
+  if (!ytClient) {
+    ytClient = await Innertube.create({
+      client_type: "ANDROID",
+      generate_session_locally: true
+    });
+  }
+  return ytClient;
 }
 
-function isBad(url){
+/* -------------------------------------------------- */
+/* Instance Health */
+/* -------------------------------------------------- */
 
-  const t = bad.get(url);
+const badInstances = new Map();
+const nextIndex = { invidious: 0, piped: 0 };
 
-  if(!t) return false;
+function markBad(instance) {
+  badInstances.set(instance, Date.now());
+}
 
-  if(Date.now()-t > INSTANCE_BAN_MS){
-    bad.delete(url);
+function isBad(instance) {
+  const t = badInstances.get(instance);
+  if (!t) return false;
+
+  if (Date.now() - t > INSTANCE_BAN_MS) {
+    badInstances.delete(instance);
     return false;
   }
 
   return true;
-
 }
 
-/* ---------------- Utils ---------------- */
+function rotateInstances(list, key) {
 
-function normalizeUrl(base,url){
+  const idx = nextIndex[key] % list.length;
+  nextIndex[key] = (idx + 1) % list.length;
 
-  if(!url) return null;
+  const rotated = [...list.slice(idx), ...list.slice(0, idx)];
+  const healthy = rotated.filter(i => !isBad(i));
 
-  if(url.startsWith("http"))
-    return url;
-
-  return base + url;
-
+  return healthy.length ? healthy : rotated;
 }
 
-/* ---------------- HLS ---------------- */
+/* -------------------------------------------------- */
+/* Utilities */
+/* -------------------------------------------------- */
 
-async function resolveHls(master){
+function safeEqual(a,b){
+  const A = Buffer.from(a,"hex");
+  const B = Buffer.from(b,"hex");
 
-  try{
+  if (A.length !== B.length) return false;
 
-    const r = await fetch(master);
-    if(!r.ok) return master;
-
-    const text = await r.text();
-    const lines = text.split("\n");
-
-    const variants=[];
-
-    for(let i=0;i<lines.length;i++){
-
-      if(lines[i].startsWith("#EXT-X-STREAM-INF")){
-
-        const next = lines[i+1];
-
-        const m = lines[i].match(/RESOLUTION=(\d+)x(\d+)/);
-
-        const h = m ? Number(m[2]) : 0;
-
-        if(next && !next.startsWith("#")){
-
-          variants.push({
-            height:h,
-            url:new URL(next,master).href
-          });
-
-        }
-
-      }
-
-    }
-
-    if(!variants.length) return master;
-
-    variants.sort((a,b)=>b.height-a.height);
-
-    return variants[0].url;
-
-  }catch{
-
-    return master;
-
-  }
-
+  return crypto.timingSafeEqual(A,B);
 }
 
-/* ---------------- Format Helpers ---------------- */
+function parseUrl(format){
 
-function parseUrl(f){
-
-  if(f.url) return f.url;
+  if (format.url) return format.url;
 
   const cipher =
-    f.signatureCipher ||
-    f.signature_cipher ||
-    f.cipher;
+    format.signatureCipher ||
+    format.signature_cipher ||
+    format.cipher;
 
-  if(!cipher) return null;
+  if (!cipher) return null;
 
-  return new URLSearchParams(cipher).get("url");
+  try {
+    return new URLSearchParams(cipher).get("url");
+  } catch {
+    return null;
+  }
 
 }
 
 function normalizeFormats(sd){
 
   return [
-    ...(sd.formats||[]),
-    ...(sd.adaptive_formats||[])
-  ].map(f=>({
+    ...(sd.formats || []),
+    ...(sd.adaptive_formats || [])
+  ].map(f => ({
     ...f,
-    mime:(f.mimeType||f.mime_type||"").toLowerCase()
+    mime: (f.mimeType || f.mime_type || "").toLowerCase()
   }));
 
 }
 
-function bestVideo(formats){
+/* -------------------------------------------------- */
+/* Format Selection */
+/* -------------------------------------------------- */
+
+function selectBestVideo(formats){
 
   return formats
-    .filter(f=>f.mime.includes("video"))
-    .sort((a,b)=>(b.height||0)-(a.height||0))[0];
+    .filter(f => f.mime.includes("video"))
+    .sort((a,b)=>
+      (b.height || 0) - (a.height || 0) ||
+      (b.bitrate || 0) - (a.bitrate || 0)
+    )[0] || null;
 
 }
 
-function bestAudio(formats){
+function selectBestAudio(formats){
 
   return formats
-    .filter(f=>f.mime.includes("audio"))
-    .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0];
+    .filter(f => f.mime.includes("audio"))
+    .sort((a,b)=>
+      (b.bitrate || 0) - (a.bitrate || 0)
+    )[0] || null;
 
 }
 
-function bestProgressive(formats){
+function selectBestProgressive(formats){
 
   return formats
-    .filter(f=>f.mime.includes("video") && /mp4a|aac|opus/.test(f.mime))
-    .sort((a,b)=>(b.height||0)-(a.height||0))[0];
+    .filter(f =>
+      f.mime.includes("video") &&
+      /mp4a|aac|opus/.test(f.mime)
+    )
+    .sort((a,b)=>
+      (b.height || 0) - (a.height || 0)
+    )[0] || null;
 
 }
 
-/* ---------------- Instance Racing ---------------- */
+/* -------------------------------------------------- */
+/* HLS Rejection */
+/* -------------------------------------------------- */
 
-async function fastest(list,build,parser){
+function rejectHLS(streamingData){
 
-  const controllers=[];
+  if (
+    streamingData?.hlsManifestUrl ||
+    streamingData?.hls_manifest_url
+  ) {
 
-  const tasks=list
-    .filter(i=>!isBad(i))
-    .map(async base=>{
+    const err = new Error("HLS streams are not supported");
+    err.status = 415;
 
-      const c=new AbortController();
-      controllers.push(c);
-
-      try{
-
-        const r = await fetch(build(base),{signal:c.signal});
-
-        if(!r.ok) throw 0;
-
-        const j = await r.json();
-
-        const parsed = parser(j,base);
-
-        if(!parsed) throw 0;
-
-        return parsed;
-
-      }catch{
-
-        markBad(base);
-        throw 0;
-
-      }
-
-    });
-
-  const res = await Promise.any(tasks);
-
-  controllers.forEach(c=>c.abort());
-
-  return res;
-
-}
-
-/* ---------------- Providers ---------------- */
-
-async function fromInvidious(id){
-
-  return fastest(
-    INVIDIOUS,
-    b=>`${b}/api/v1/videos/${id}`,
-    (d,b)=>{
-
-      if(d.hlsUrl){
-
-        return{
-          provider:"invidious",
-          streaming_data:{
-            hlsManifestUrl:normalizeUrl(b,d.hlsUrl)
-          }
-        };
-
-      }
-
-      const formats=[];
-
-      if(d.formatStreams)
-        d.formatStreams.forEach(f=>formats.push({...f,mimeType:f.type}));
-
-      if(d.adaptiveFormats)
-        d.adaptiveFormats.forEach(f=>formats.push({...f,mimeType:f.type}));
-
-      if(!formats.length) return null;
-
-      return{
-        provider:"invidious",
-        streaming_data:{formats}
-      };
-
-    }
-  );
-
-}
-
-async function fromPiped(id){
-
-  return fastest(
-    PIPED,
-    b=>`${b}/streams/${id}`,
-    (d,b)=>{
-
-      if(d.hls){
-
-        return{
-          provider:"piped",
-          streaming_data:{
-            hlsManifestUrl:normalizeUrl(b,d.hls)
-          }
-        };
-
-      }
-
-      const formats=[
-        ...(d.videoStreams||[]),
-        ...(d.audioStreams||[])
-      ];
-
-      if(!formats.length) return null;
-
-      return{
-        provider:"piped",
-        streaming_data:{formats}
-      };
-
-    }
-  );
-
-}
-
-let yt;
-
-async function fromInnertube(id){
-
-  if(!yt){
-
-    yt = await Innertube.create({
-      client_type:"ANDROID",
-      generate_session_locally:true
-    });
-
+    throw err;
   }
 
-  const info = await yt.getInfo(id);
+}
 
-  return{
-    provider:"innertube",
-    streaming_data:info.streaming_data
+/* -------------------------------------------------- */
+/* Parallel Fetch */
+/* -------------------------------------------------- */
+
+async function fastestFetch(instances, buildUrl, parser){
+
+  const controllers = [];
+
+  const tasks = instances.map(async base => {
+
+    const controller = new AbortController();
+    controllers.push(controller);
+
+    try{
+
+      const res = await fetch(buildUrl(base), {
+        signal: controller.signal
+      });
+
+      if (!res.ok) throw new Error();
+
+      const data = await res.json();
+      const parsed = parser(data);
+
+      if (!parsed) throw new Error();
+
+      return parsed;
+
+    }catch{
+
+      markBad(base);
+      throw new Error();
+
+    }
+
+  });
+
+  const result = await Promise.any(tasks);
+
+  controllers.forEach(c => c.abort());
+
+  return result;
+
+}
+
+/* -------------------------------------------------- */
+/* Providers */
+/* -------------------------------------------------- */
+
+async function fetchFromInvidious(id){
+
+  const instances = rotateInstances(
+    INVIDIOUS_INSTANCES,
+    "invidious"
+  );
+
+  return fastestFetch(
+    instances,
+    base => `${base}/api/v1/videos/${id}`,
+    data => {
+
+      const formats = [];
+
+      data.formatStreams?.forEach(f =>
+        formats.push({ ...f, mimeType: f.type })
+      );
+
+      data.adaptiveFormats?.forEach(f =>
+        formats.push({ ...f, mimeType: f.type })
+      );
+
+      if (!formats.length) return null;
+
+      return {
+        provider: "invidious",
+        streaming_data: { formats }
+      };
+
+    }
+  );
+
+}
+
+async function fetchFromPiped(id){
+
+  const instances = rotateInstances(
+    PIPED_INSTANCES,
+    "piped"
+  );
+
+  return fastestFetch(
+    instances,
+    base => `${base}/streams/${id}`,
+    data => {
+
+      const formats = [];
+
+      data.videoStreams?.forEach(v => formats.push(v));
+      data.audioStreams?.forEach(a => formats.push(a));
+
+      if (!formats.length) return null;
+
+      return {
+        provider: "piped",
+        streaming_data: { formats }
+      };
+
+    }
+  );
+
+}
+
+async function fetchFromInnertube(id){
+
+  const client = await getYtClient();
+  const info = await client.getInfo(id);
+
+  if (!info?.streaming_data)
+    throw new Error("No streaming data");
+
+  return {
+    provider: "innertube",
+    streaming_data: info.streaming_data
   };
 
 }
 
-/* ---------------- Fetch Router ---------------- */
+async function fetchStreamingInfo(id){
 
-async function getStreaming(id){
+  try { return await fetchFromInvidious(id); } catch {}
+  try { return await fetchFromPiped(id); } catch {}
 
-  try{ return await fromInvidious(id); }catch{}
-  try{ return await fromPiped(id); }catch{}
-
-  return fromInnertube(id);
+  return fetchFromInnertube(id);
 
 }
 
-/* ---------------- Auth ---------------- */
+/* -------------------------------------------------- */
+/* Worker Auth */
+/* -------------------------------------------------- */
 
-function safeEqual(a,b){
+function verifyWorkerAuth(req,res,next){
 
-  const A=Buffer.from(a,"hex");
-  const B=Buffer.from(b,"hex");
+  const ts = req.header("x-proxy-timestamp");
+  const sig = req.header("x-proxy-signature");
 
-  if(A.length!==B.length) return false;
-
-  return crypto.timingSafeEqual(A,B);
-
-}
-
-function auth(req,res,next){
-
-  const ts=req.header("x-proxy-timestamp");
-  const sig=req.header("x-proxy-signature");
-
-  if(!ts||!sig)
+  if (!ts || !sig)
     return res.status(401).json({error:"unauthorized"});
 
-  const now=Math.floor(Date.now()/1000);
+  const now = Math.floor(Date.now()/1000);
 
-  if(Math.abs(now-Number(ts))>ALLOWED_WINDOW)
+  if (Math.abs(now - Number(ts)) > ALLOWED_WINDOW)
     return res.status(401).json({error:"unauthorized"});
 
-  const payload=`${ts}:${req.originalUrl}`;
+  const payload = `${ts}:${req.originalUrl}`;
 
-  const expected=crypto
-    .createHmac("sha256",WORKER_SECRET)
+  const expected = crypto
+    .createHmac("sha256", WORKER_SECRET)
     .update(payload)
     .digest("hex");
 
-  if(!safeEqual(expected,sig))
+  if (!safeEqual(expected, sig))
     return res.status(401).json({error:"unauthorized"});
 
   next();
 
 }
 
-/* ---------------- API ---------------- */
+/* -------------------------------------------------- */
+/* API */
+/* -------------------------------------------------- */
 
-app.get("/api/stream",auth,async(req,res)=>{
+app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
 
   try{
 
-    const id=req.query.id;
+    const id = req.query.id;
 
-    if(!id)
+    if (!id)
       return res.status(400).json({error:"id required"});
 
-    const info = await getStreaming(id);
+    const info = await fetchStreamingInfo(id);
     const sd = info.streaming_data;
 
-    const hls =
-      sd.hlsManifestUrl ||
-      sd.hls_manifest_url ||
-      sd.hlsUrl ||
-      sd.hls;
-
-    if(hls){
-
-      const url = await resolveHls(hls);
-
-      return res.json({
-        type:"hls",
-        url,
-        manifest:hls,
-        provider:info.provider
-      });
-
-    }
+    rejectHLS(sd);
 
     const formats = normalizeFormats(sd);
 
-    const v = bestVideo(formats);
-    const a = bestAudio(formats);
+    const video = selectBestVideo(formats);
+    const audio = selectBestAudio(formats);
 
-    if(v && a){
+    if (video && audio){
 
       return res.json({
         type:"dash",
-        quality:v.height,
-        video_url:parseUrl(v),
-        audio_url:parseUrl(a),
-        provider:info.provider
+        quality: video.height || null,
+        video_url: parseUrl(video),
+        audio_url: parseUrl(audio),
+        video_itag: video.itag,
+        audio_itag: audio.itag,
+        provider: info.provider
       });
 
     }
 
-    const p = bestProgressive(formats);
+    const progressive = selectBestProgressive(formats);
 
-    if(p){
+    if (progressive){
 
       return res.json({
         type:"progressive",
-        quality:p.height,
-        url:parseUrl(p),
-        provider:info.provider
+        quality: progressive.height || null,
+        url: parseUrl(progressive),
+        itag: progressive.itag,
+        provider: info.provider
       });
 
     }
 
-    res.status(404).json({error:"no stream"});
+    return res.status(404).json({error:"no stream"});
 
   }catch(e){
 
-    res.status(500).json({error:e.message});
+    return res.status(e.status || 500).json({
+      error: e.message
+    });
 
   }
 
 });
 
-app.listen(port,()=>{
-  console.log("server running",port);
+/* -------------------------------------------------- */
+
+app.listen(PORT,()=>{
+  console.log(`Server running on ${PORT}`);
 });
