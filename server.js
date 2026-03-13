@@ -29,14 +29,43 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
 const UPSTREAM_TIMEOUT_MS = 10000;
 const INSTANCE_BAN_MS = 5 * 60 * 1000;
 
+// ---------------- Instance lists ----------------
 const INVIDIOUS_INSTANCES = [
-  // "https://inv1.example.com",
-  // "https://inv2.example.com"
+  "https://inv.nadeko.net",
+  "https://invidious.f5.si",
+  "https://invidious.lunivers.trade",
+  "https://invidious.ducks.party",
+  "https://iv.melmac.space",
+  "https://yt.omada.cafe",
+  "https://invidious.nerdvpn.de",
+  "https://invidious.privacyredirect.com",
+  "https://invidious.technicalvoid.dev",
+  "https://invidious.darkness.services",
+  "https://invidious.nikkosphere.com",
+  "https://invidious.schenkel.eti.br",
+  "https://invidious.tiekoetter.com",
+  "https://invidious.perennialte.ch",
+  "https://invidious.reallyaweso.me",
+  "https://invidious.private.coffee",
+  "https://invidious.privacydev.net",
 ];
 
 const PIPED_INSTANCES = [
-  // "https://piped1.example.com",
-  // "https://piped2.example.com"
+  "https://pipedapi.kavin.rocks",
+  "https://pipedapi.leptons.xyz",
+  "https://pipedapi.nosebs.ru",
+  "https://pipedapi-libre.kavin.rocks",
+  "https://piped-api.privacy.com.de",
+  "https://pipedapi.adminforge.de",
+  "https://api.piped.yt",
+  "https://pipedapi.drgns.space",
+  "https://pipedapi.owo.si",
+  "https://pipedapi.ducks.party",
+  "https://piped-api.codespace.cz",
+  "https://pipedapi.reallyaweso.me",
+  "https://api.piped.private.coffee",
+  "https://pipedapi.darkness.services",
+  "https://pipedapi.orangenet.cc",
 ];
 
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
