@@ -2,25 +2,20 @@ import express from "express";
 import { Innertube } from "youtubei.js";
 import crypto from "crypto";
 
-/* -------------------------------------------------- */
-/* Config */
-/* -------------------------------------------------- */
-
-const PORT = process.env.PORT || 3000;
-
-if (!process.env.WORKER_SECRET) {
-  console.error("WORKER_SECRET is required");
-  process.exit(1);
-}
+const app = express();
+const port = process.env.PORT || 3000;
 
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
-const ALLOWED_WINDOW = 300;
-const INSTANCE_BAN_MS = 5 * 60 * 1000;
+if (!WORKER_SECRET) {
+  console.error("WORKER_SECRET required");
+  process.exit(1);
+}
 
-/* -------------------------------------------------- */
-/* Instances */
-/* -------------------------------------------------- */
+const ALLOWED_WINDOW = 300;
+const INSTANCE_BAN_MS = 300000;
+
+/* ---------------- Instances ---------------- */
 
 const INVIDIOUS_INSTANCES = [
   "https://inv.nadeko.net",
@@ -30,7 +25,7 @@ const INVIDIOUS_INSTANCES = [
   "https://yt.omada.cafe",
   "https://invidious.nerdvpn.de",
   "https://invidious.tiekoetter.com",
-  "https://yewtu.be"
+  "https://yewtu.be",
 ];
 
 const PIPED_INSTANCES = [
@@ -48,412 +43,249 @@ const PIPED_INSTANCES = [
   "https://pipedapi.reallyaweso.me",
   "https://api.piped.private.coffee",
   "https://pipedapi.darkness.services",
-  "https://pipedapi.orangenet.cc"
+  "https://pipedapi.orangenet.cc",
 ];
 
-/* -------------------------------------------------- */
-/* Express */
-/* -------------------------------------------------- */
+/* ---------------- Health ---------------- */
 
-const app = express();
+const bad = new Map();
 
-/* -------------------------------------------------- */
-/* Innertube */
-/* -------------------------------------------------- */
-
-let ytClient;
-
-async function getYtClient() {
-  if (!ytClient) {
-    ytClient = await Innertube.create({
-      client_type: "ANDROID",
-      generate_session_locally: true
-    });
-  }
-  return ytClient;
+function markBad(url){
+  bad.set(url,Date.now());
 }
 
-/* -------------------------------------------------- */
-/* Instance Health */
-/* -------------------------------------------------- */
-
-const badInstances = new Map();
-const nextIndex = { invidious: 0, piped: 0 };
-
-function markBad(instance) {
-  badInstances.set(instance, Date.now());
-}
-
-function isBad(instance) {
-  const t = badInstances.get(instance);
-  if (!t) return false;
-
-  if (Date.now() - t > INSTANCE_BAN_MS) {
-    badInstances.delete(instance);
+function isBad(url){
+  const t = bad.get(url);
+  if(!t) return false;
+  if(Date.now()-t > INSTANCE_BAN_MS){
+    bad.delete(url);
     return false;
   }
-
   return true;
 }
 
-function rotateInstances(list, key) {
+/* ---------------- Utils ---------------- */
 
-  const idx = nextIndex[key] % list.length;
-  nextIndex[key] = (idx + 1) % list.length;
-
-  const rotated = [...list.slice(idx), ...list.slice(0, idx)];
-  const healthy = rotated.filter(i => !isBad(i));
-
-  return healthy.length ? healthy : rotated;
+function normalizeUrl(base,url){
+  if(!url) return null;
+  if(url.startsWith("http")) return url;
+  return base + url;
 }
 
-/* -------------------------------------------------- */
-/* Utilities */
-/* -------------------------------------------------- */
+/* ---------------- HLS ---------------- */
 
-function safeEqual(a,b){
-  const A = Buffer.from(a,"hex");
-  const B = Buffer.from(b,"hex");
-
-  if (A.length !== B.length) return false;
-
-  return crypto.timingSafeEqual(A,B);
-}
-
-function parseUrl(format){
-
-  if (format.url) return format.url;
-
-  const cipher =
-    format.signatureCipher ||
-    format.signature_cipher ||
-    format.cipher;
-
-  if (!cipher) return null;
-
-  try {
-    return new URLSearchParams(cipher).get("url");
-  } catch {
-    return null;
+async function resolveHls(master){
+  try{
+    const r = await fetch(master);
+    if(!r.ok) return master;
+    const text = await r.text();
+    const lines = text.split("\n");
+    const variants=[];
+    for(let i=0;i<lines.length;i++){
+      if(lines[i].startsWith("#EXT-X-STREAM-INF")){
+        const next = lines[i+1];
+        const m = lines[i].match(/RESOLUTION=(\d+)x(\d+)/);
+        const h = m ? Number(m[2]) : 0;
+        if(next && !next.startsWith("#")){
+          variants.push({ height:h, url:new URL(next,master).href });
+        }
+      }
+    }
+    if(!variants.length) return master;
+    variants.sort((a,b)=>b.height-a.height);
+    return variants[0].url;
+  }catch{
+    return master;
   }
+}
 
+/* ---------------- Format Helpers ---------------- */
+
+function parseUrl(f){
+  if(f.url) return f.url;
+  const cipher = f.signatureCipher || f.signature_cipher || f.cipher;
+  if(!cipher) return null;
+  return new URLSearchParams(cipher).get("url");
 }
 
 function normalizeFormats(sd){
-
   return [
-    ...(sd.formats || []),
-    ...(sd.adaptive_formats || [])
-  ].map(f => ({
+    ...(sd.formats||[]),
+    ...(sd.adaptive_formats||[])
+  ].map(f=>({
     ...f,
-    mime: (f.mimeType || f.mime_type || "").toLowerCase()
+    mime:(f.mimeType||f.mime_type||"").toLowerCase()
   }));
-
 }
 
-/* -------------------------------------------------- */
-/* Format Selection */
-/* -------------------------------------------------- */
-
-function selectBestVideo(formats){
-
+function bestVideo(formats){
   return formats
-    .filter(f => f.mime.includes("video"))
-    .sort((a,b)=>
-      (b.height || 0) - (a.height || 0) ||
-      (b.bitrate || 0) - (a.bitrate || 0)
-    )[0] || null;
-
+    .filter(f=>f.mime.includes("video"))
+    .sort((a,b)=>(b.height||0)-(a.height||0))[0];
 }
 
-function selectBestAudio(formats){
-
+function bestAudio(formats){
   return formats
-    .filter(f => f.mime.includes("audio"))
-    .sort((a,b)=>
-      (b.bitrate || 0) - (a.bitrate || 0)
-    )[0] || null;
-
+    .filter(f=>f.mime.includes("audio"))
+    .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0];
 }
 
-function selectBestProgressive(formats){
-
+function bestProgressive(formats){
   return formats
-    .filter(f =>
-      f.mime.includes("video") &&
-      /mp4a|aac|opus/.test(f.mime)
-    )
-    .sort((a,b)=>
-      (b.height || 0) - (a.height || 0)
-    )[0] || null;
-
+    .filter(f=>f.mime.includes("video") && /mp4a|aac|opus/.test(f.mime))
+    .sort((a,b)=>(b.height||0)-(a.height||0))[0];
 }
 
-/* -------------------------------------------------- */
-/* フォーマット判定 */
-/* -------------------------------------------------- */
+/* ---------------- Instance Racing ---------------- */
 
-function isSupportedFormat(f) {
+async function fastest(list, build, parser){
+  const controllers=[];
+  const tasks=list
+    .filter(i=>!isBad(i))
+    .map(async base=>{
+      const c=new AbortController();
+      controllers.push(c);
+      try{
+        const r = await fetch(build(base),{signal:c.signal});
+        if(!r.ok) throw 0;
+        const j = await r.json();
+        const parsed = parser(j,base);
+        if(!parsed) throw 0;
+        return parsed;
+      }catch{
+        markBad(base);
+        throw 0;
+      }
+    });
 
-  const url = f.url || parseUrl(f);
-  if (!url) return false;
-
-  const mime = (f.mimeType || f.mime_type || "").toLowerCase();
-
-  // -----------------------------
-  // DASH / Progressive 判定
-  // -----------------------------
-  if (
-    mime.includes("video/mp4") ||
-    mime.includes("audio/mp4") ||
-    mime.includes("video/webm") ||
-    mime.includes("audio/webm") ||
-    /audio\/opus|audio\/aac|audio\/mp3/.test(mime)
-  ) {
-    return true;
-  }
-
-  // -----------------------------
-  // その他は非対応
-  // -----------------------------
-  return false;
+  const res = await Promise.any(tasks);
+  controllers.forEach(c=>c.abort());
+  return res;
 }
 
-/* -------------------------------------------------- */
-/* Parallel Fetch */
-/* -------------------------------------------------- */
+/* ---------------- Providers ---------------- */
 
-async function fastestFetch(instances, buildUrl, parser){
-
-  const controllers = [];
-
-  const tasks = instances.map(async base => {
-
-    const controller = new AbortController();
-    controllers.push(controller);
-
-    try{
-
-      const res = await fetch(buildUrl(base), {
-        signal: controller.signal
-      });
-
-      if (!res.ok) throw new Error();
-
-      const data = await res.json();
-      const parsed = parser(data);
-
-      if (!parsed) throw new Error();
-
-      return parsed;
-
-    }catch{
-
-      markBad(base);
-      throw new Error();
-
-    }
-
-  });
-
-  const result = await Promise.any(tasks);
-
-  controllers.forEach(c => c.abort());
-
-  return result;
-
-}
-
-/* -------------------------------------------------- */
-/* Providers */
-/* -------------------------------------------------- */
-
-async function fetchFromInvidious(id){
-
-  const instances = rotateInstances(
+async function fromInvidious(id){
+  return fastest(
     INVIDIOUS_INSTANCES,
-    "invidious"
-  );
-
-  return fastestFetch(
-    instances,
-    base => `${base}/api/v1/videos/${id}`,
-    data => {
-
-      const formats = [];
-
-      data.formatStreams?.forEach(f =>
-        formats.push({ ...f, mimeType: f.type })
-      );
-
-      data.adaptiveFormats?.forEach(f =>
-        formats.push({ ...f, mimeType: f.type })
-      );
-
-      if (!formats.length) return null;
-
-      return {
-        provider: "invidious",
-        streaming_data: { formats }
-      };
-
+    b=>`${b}/api/v1/videos/${id}`,
+    (d,b)=>{
+      const formats=[];
+      if(d.formatStreams)
+        d.formatStreams.forEach(f=>formats.push({...f,mimeType:f.type}));
+      if(d.adaptiveFormats)
+        d.adaptiveFormats.forEach(f=>formats.push({...f,mimeType:f.type}));
+      if(!formats.length) return null;
+      return { provider:"invidious", streaming_data:{formats} };
     }
   );
-
 }
 
-async function fetchFromPiped(id){
-
-  const instances = rotateInstances(
+async function fromPiped(id){
+  return fastest(
     PIPED_INSTANCES,
-    "piped"
-  );
-
-  return fastestFetch(
-    instances,
-    base => `${base}/streams/${id}`,
-    data => {
-
-      const formats = [];
-
-      data.videoStreams?.forEach(v => formats.push(v));
-      data.audioStreams?.forEach(a => formats.push(a));
-
-      if (!formats.length) return null;
-
-      return {
-        provider: "piped",
-        streaming_data: { formats }
-      };
-
+    b=>`${b}/streams/${id}`,
+    (d,b)=>{
+      const formats=[...(d.videoStreams||[]), ...(d.audioStreams||[])];
+      if(!formats.length) return null;
+      return { provider:"piped", streaming_data:{formats} };
     }
   );
-
 }
 
-async function fetchFromInnertube(id){
+let yt;
 
-  const client = await getYtClient();
-  const info = await client.getInfo(id);
-
-  if (!info?.streaming_data)
-    throw new Error("No streaming data");
-
-  return {
-    provider: "innertube",
-    streaming_data: info.streaming_data
-  };
-
+async function fromInnertube(id){
+  if(!yt){
+    yt = await Innertube.create({
+      client_type:"ANDROID",
+      generate_session_locally:true
+    });
+  }
+  const info = await yt.getInfo(id);
+  return { provider:"innertube", streaming_data:info.streaming_data };
 }
 
-async function fetchStreamingInfo(id){
+/* ---------------- Fetch Router ---------------- */
 
-  try { return await fetchFromInvidious(id); } catch {}
-  try { return await fetchFromPiped(id); } catch {}
-
-  return fetchFromInnertube(id);
-
+async function getStreaming(id){
+  try{ return await fromInvidious(id); }catch{}
+  try{ return await fromPiped(id); }catch{}
+  return fromInnertube(id);
 }
 
-/* -------------------------------------------------- */
-/* Worker Auth */
-/* -------------------------------------------------- */
+/* ---------------- Auth ---------------- */
 
-function verifyWorkerAuth(req,res,next){
+function safeEqual(a,b){
+  const A=Buffer.from(a,"hex");
+  const B=Buffer.from(b,"hex");
+  if(A.length!==B.length) return false;
+  return crypto.timingSafeEqual(A,B);
+}
 
-  const ts = req.header("x-proxy-timestamp");
-  const sig = req.header("x-proxy-signature");
-
-  if (!ts || !sig)
+function auth(req,res,next){
+  const ts=req.header("x-proxy-timestamp");
+  const sig=req.header("x-proxy-signature");
+  if(!ts||!sig) return res.status(401).json({error:"unauthorized"});
+  const now=Math.floor(Date.now()/1000);
+  if(Math.abs(now-Number(ts))>ALLOWED_WINDOW)
     return res.status(401).json({error:"unauthorized"});
-
-  const now = Math.floor(Date.now()/1000);
-
-  if (Math.abs(now - Number(ts)) > ALLOWED_WINDOW)
+  const payload=`${ts}:${req.originalUrl}`;
+  const expected=crypto.createHmac("sha256",WORKER_SECRET).update(payload).digest("hex");
+  if(!safeEqual(expected,sig))
     return res.status(401).json({error:"unauthorized"});
-
-  const payload = `${ts}:${req.originalUrl}`;
-
-  const expected = crypto
-    .createHmac("sha256", WORKER_SECRET)
-    .update(payload)
-    .digest("hex");
-
-  if (!safeEqual(expected, sig))
-    return res.status(401).json({error:"unauthorized"});
-
   next();
-
 }
 
-/* -------------------------------------------------- */
-/* API */
-/* -------------------------------------------------- */
+/* ---------------- API ---------------- */
 
-app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
+app.get("/api/stream", auth, async (req, res) => {
   try {
     const id = req.query.id;
     if (!id) return res.status(400).json({ error: "id required" });
 
-    // -----------------------
-    // 1. Streaming info 取得
-    // -----------------------
-    const info = await fetchStreamingInfo(id);
+    const info = await getStreaming(id);
     const sd = info.streaming_data;
 
-    // -----------------------
-    // 2. フォーマットをサニタイズ
-    // DASH/Progressiveのみ残す
-    // -----------------------
-    const formats = [...(sd.formats || []), ...(sd.adaptive_formats || [])]
-      .filter(isSupportedFormat)
-      .map(f => ({ ...f, mime: (f.mimeType || f.mime_type || "").toLowerCase() }));
-
-    if (!formats.length) {
-      return res.status(415).json({
-        error: "No supported stream formats available (DASH/Progressive only, HLS rejected)"
-      });
+    // HLS が存在する場合は明示的にエラーを返す
+    const hls = sd.hlsManifestUrl || sd.hls_manifest_url || sd.hlsUrl || sd.hls;
+    if (hls) {
+      return res.status(400).json({ error: "HLS streams are not supported" });
     }
 
-    // -----------------------
-    // 3. 最高画質の選択
-    // -----------------------
-    const video = selectBestVideo(formats);
-    const audio = selectBestAudio(formats);
+    const formats = normalizeFormats(sd);
 
-    if (video && audio) {
+    const v = bestVideo(formats);
+    const a = bestAudio(formats);
+
+    if (v && a) {
       return res.json({
         type: "dash",
-        quality: video.height || null,
-        video_url: parseUrl(video),
-        audio_url: parseUrl(audio),
-        video_itag: video.itag,
-        audio_itag: audio.itag,
+        quality: v.height,
+        video_url: parseUrl(v),
+        audio_url: parseUrl(a),
         provider: info.provider
       });
     }
 
-    const progressive = selectBestProgressive(formats);
+    const p = bestProgressive(formats);
 
-    if (progressive) {
+    if (p) {
       return res.json({
         type: "progressive",
-        quality: progressive.height || null,
-        url: parseUrl(progressive),
-        itag: progressive.itag,
+        quality: p.height,
+        url: parseUrl(p),
         provider: info.provider
       });
     }
 
-    return res.status(404).json({ error: "no stream available" });
+    res.status(404).json({ error: "no stream available" });
 
   } catch (e) {
-    return res.status(e.status || 500).json({ error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
-/* -------------------------------------------------- */
-
-app.listen(PORT,()=>{
-  console.log(`Server running on ${PORT}`);
+app.listen(port, () => {
+  console.log("server running", port);
 });
