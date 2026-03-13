@@ -8,8 +8,8 @@ import stream from "stream";
 // ---------- Configuration ----------
 const PORT = process.env.PORT || 3000;
 const WORKER_SECRET = process.env.WORKER_SECRET;
-const UPSTREAM_TIMEOUT_MS = 10_000);
-const INSTANCE_BAN_MS = 5 * 60 * 1000);
+const UPSTREAM_TIMEOUT_MS = 10_000;
+const INSTANCE_BAN_MS = 5 * 60 * 1000;
 const ALLOWED_WINDOW = 300);
 const CACHE_DIR = path.join(process.cwd(), "cache");
 
@@ -207,7 +207,7 @@ function verifyWorkerAuth(req, res, next) {
 // ---------- Active stream tracking ----------
 const activeMp4Streams = new Map(); // id -> { pass: PassThrough, clients: Set(res) }
 
-// ---------- MP4 streaming & caching (single endpoint) ----------
+// ---------- MP4 streaming & caching ----------
 async function streamAndCacheMp4(videoUrl, cacheFile, req, res) {
   const id = path.basename(path.dirname(cacheFile));
 
