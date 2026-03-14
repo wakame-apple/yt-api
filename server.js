@@ -14,6 +14,7 @@ const port = PORT || 3000;
 
 const ALLOWED_WINDOW = 300; // seconds
 const INSTANCE_BAN_MS = 5 * 60 * 1000; // 5 minutes
+const YT_ID_REGEX = /^[a-zA-Z0-9_-]{11}$/;
 
 /* ---------------- Invidious instances ---------------- */
 const INVIDIOUS_INSTANCES = [
@@ -219,11 +220,18 @@ const verifyWorkerAuth = (req, res, next) => {
   next();
 };
 
+function isValidVideoId(id) {
+  return typeof id === "string" && YT_ID_REGEX.test(id);
+}
+
 /* ---------------- API ---------------- */
 app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
   try {
     const id = req.query.id;
     if (!id) return res.status(400).json({ error: 'id required' });
+
+    if (!isValidVideoId(id))
+      return res.status(400).json({error:"invalid video id"});
 
     const info = await fetchStreamingInfo(String(id));
     const sd = info.streaming_data || {};
