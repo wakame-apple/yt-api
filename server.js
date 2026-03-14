@@ -449,7 +449,6 @@ app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
 
       return res.json({
         type:"dash",
-        quality: video.height || null,
         video_url: parseUrl(video),
         audio_url: parseUrl(audio),
         provider: info.provider
@@ -465,7 +464,6 @@ app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
 
       return res.json({
         type:"progressive",
-        quality: progressive.height || null,
         url: parseUrl(progressive),
         provider: info.provider
       });
