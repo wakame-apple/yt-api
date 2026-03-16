@@ -331,7 +331,7 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
 
     const providerObj = {
       name: info.provider || null,
-      url: info.provider === 'innertube' ? null : info.instance || null,
+      url: info.instance || null,
     };
 
     if (video && audio) {
