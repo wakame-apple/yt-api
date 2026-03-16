@@ -70,17 +70,8 @@ export default {
     return new Response(nodeRes.body, {
       status: nodeRes.status,
       headers: {
-        ...corsHeaders(),
         "content-type": nodeRes.headers.get("content-type") || "application/json"
       }
     });
   }
 };
-
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS"
-  };
-}
