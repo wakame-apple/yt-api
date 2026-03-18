@@ -1,3 +1,5 @@
+import dotenv from 'dotenv';
+dotenv.config();
 import express from 'express';
 import { Innertube, Platform } from 'youtubei.js';
 import crypto from 'crypto';
