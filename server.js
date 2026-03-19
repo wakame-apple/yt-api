@@ -3,10 +3,14 @@ import express from 'express';
 import crypto from 'crypto';
 import { spawn } from 'node:child_process';
 
-// ------------------------
-// Configuration / Constants
-// ------------------------
-const { WORKER_SECRET, PORT = 3000, PROXY_URL } = process.env;
+// =====================================================
+// Config
+// =====================================================
+const {
+  WORKER_SECRET,
+  PORT = 3000,
+  PROXY_URL,
+} = process.env;
 
 if (!WORKER_SECRET) {
   console.error('WORKER_SECRET is required');
@@ -16,486 +20,278 @@ if (!WORKER_SECRET) {
 const app = express();
 const port = Number(PORT) || 3000;
 
-const ALLOWED_WINDOW_SECONDS = 300;
-const REQUEST_TIMEOUT_MS = 5_000;
-const INSTANCE_BAN_MS = 5 * 60 * 1000;
-const YT_DLP_TIMEOUT_MS = 10_000;
-const YT_DLP_BIN = '/opt/venv/bin/yt-dlp';
-const YT_ID_REGEX = /^[a-zA-Z0-9_-]{11}$/;
-
-const INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://invidious.f5.si',
-  'https://invidious.lunivers.trade',
-  'https://iv.melmac.space',
-  'https://yt.omada.cafe',
-  'https://invidious.nerdvpn.de',
-  'https://invidious.tiekoetter.com',
-  'https://yewtu.be',
-];
-
-const MANIFEST_KEYS = [
-  'hlsManifestUrl',
-  'hls_manifest_url',
-  'hlsUrl',
-  'hls',
-  'dashManifestUrl',
-  'dash_manifest_url',
-  'manifest_url',
-  'manifestUrl',
-];
-
-// ------------------------
-// Auth
-// ------------------------
-const safeEqualHex = (a, b) => {
-  try {
-    const A = Buffer.from(String(a), 'hex');
-    const B = Buffer.from(String(b), 'hex');
-    if (A.length !== B.length) return false;
-    return crypto.timingSafeEqual(A, B);
-  } catch {
-    return false;
-  }
+const CONFIG = {
+  ytDlpBin: '/opt/venv/bin/yt-dlp',
+  ytTimeout: 15000,
+  requestTimeout: 5000,
+  instanceBanMs: 5 * 60 * 1000,
 };
 
-const verifyWorkerAuth = (req, res, next) => {
+const INVIDIOUS = [
+   'https://inv.nadeko.net',
+   'https://invidious.f5.si',
+   'https://invidious.lunivers.trade',
+   'https://iv.melmac.space',
+   'https://yt.omada.cafe',
+   'https://invidious.nerdvpn.de',
+   'https://invidious.tiekoetter.com',
+   'https://yewtu.be',
+ ];
+
+// =====================================================
+// Auth
+// =====================================================
+const verifyAuth = (req, res, next) => {
   const ts = req.header('x-proxy-timestamp');
   const sig = req.header('x-proxy-signature');
 
   if (!ts || !sig) return res.status(401).json({ error: 'unauthorized' });
 
-  const now = Math.floor(Date.now() / 1000);
-  const t = Number(ts);
-
-  if (!Number.isFinite(t) || Math.abs(now - t) > ALLOWED_WINDOW_SECONDS) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-
   const payload = `${ts}:${req.originalUrl}`;
   const expected = crypto.createHmac('sha256', WORKER_SECRET).update(payload).digest('hex');
 
-  if (!safeEqualHex(expected, sig)) return res.status(401).json({ error: 'unauthorized' });
+  if (expected !== sig) return res.status(401).json({ error: 'unauthorized' });
 
   next();
 };
 
-// ------------------------
+// =====================================================
+// Cache
+// =====================================================
+const CACHE = new Map();
+const TTL_SHORT = 10 * 60 * 1000;
+const TTL_LONG = 4 * 60 * 60 * 1000;
+
+const getCache = (id) => {
+  const c = CACHE.get(id);
+  if (!c) return null;
+  if (Date.now() - c.ts > c.ttl) {
+    CACHE.delete(id);
+    return null;
+  }
+  return c.data;
+};
+
+const setCache = (id, data) => {
+  const ttl = data.formats.length >= 12 ? TTL_LONG : TTL_SHORT;
+  CACHE.set(id, { ts: Date.now(), ttl, data });
+};
+
+// =====================================================
 // yt-dlp
-// ------------------------
-const runYtDlp = async (videoId, { useProxy = false } = {}) => {
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
+// =====================================================
+const runYtDlp = (id, { proxy = false } = {}) => {
+  const url = `https://www.youtube.com/watch?v=${id}`;
+
   const args = [
     '--print-json',
     '--no-playlist',
     '--no-warnings',
     '--no-progress',
     '--simulate',
-    '-f', 'bv*+ba/b',
-    '--extractor-args', 'youtube:player_client=android',
+    '-f', 'best',
+    '--extractor-args',
+    'youtube:player_client=android,web,ios,tv_embedded',
+    '--no-call-home',
   ];
 
-  if (useProxy && PROXY_URL) {
+  if (proxy && PROXY_URL) {
     args.push('--proxy', PROXY_URL);
   }
 
   args.push(url);
 
   return new Promise((resolve, reject) => {
-    const child = spawn(YT_DLP_BIN, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const p = spawn(CONFIG.ytDlpBin, args);
 
-    let stdout = '';
-    let stderr = '';
+    let out = '';
+    let err = '';
 
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-    }, YT_DLP_TIMEOUT_MS);
+    const timer = setTimeout(() => p.kill('SIGKILL'), CONFIG.ytTimeout);
 
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString('utf8');
-    });
+    p.stdout.on('data', (d) => (out += d.toString()));
+    p.stderr.on('data', (d) => (err += d.toString()));
 
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString('utf8');
-    });
-
-    child.on('error', (err) => {
+    p.on('close', (code) => {
       clearTimeout(timer);
-      reject(err);
-    });
-
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-
-      console.error('yt-dlp exit:', { code, signal });
-      console.error('stderr:', stderr);
-      console.error('stdout:', stdout.slice(0, 500));
 
       if (code !== 0) {
-        return reject(
-          new Error(
-            `yt-dlp failed (${code ?? signal ?? 'unknown'}): ${stderr.trim() || 'no stderr output'}`
-          )
-        );
+        return reject(new Error(err || 'yt-dlp failed'));
       }
 
       try {
-        resolve(JSON.parse(stdout));
+        resolve(JSON.parse(out));
       } catch {
-        reject(new Error('yt-dlp returned invalid JSON'));
+        reject(new Error('invalid json'));
       }
     });
   });
 };
 
-// ------------------------
+// =====================================================
 // Invidious
-// ------------------------
-const badInstances = new Map();
-let rrIndex = 0;
+// =====================================================
+const bad = new Map();
 
-const markInstanceBad = (instance) => {
-  badInstances.set(instance, Date.now());
-};
+const markBad = (url) => bad.set(url, Date.now());
 
-const rotateInstances = (list = []) => {
-  if (!Array.isArray(list) || list.length === 0) return [];
-
-  const start = rrIndex % list.length;
-  rrIndex = (rrIndex + 1) % list.length;
-
-  const rotated = [...list.slice(start), ...list.slice(0, start)];
-
+const validInstances = () => {
   const now = Date.now();
-  const available = rotated.filter((inst) => {
-    const t = badInstances.get(inst);
-    if (!t) return true;
-    if (now - t > INSTANCE_BAN_MS) {
-      badInstances.delete(inst);
-      return true;
-    }
-    return false;
+  return INVIDIOUS.filter((i) => {
+    const t = bad.get(i);
+    return !t || now - t > CONFIG.instanceBanMs;
   });
-
-  return available.length ? available : rotated;
 };
 
-const fastestFetch = async (instances, buildUrl, parser) => {
-  if (!instances || !instances.length) throw new Error('no instances');
+const fetchInvidious = async (id) => {
+  const list = validInstances();
 
-  const controllers = [];
+  for (const base of list) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), CONFIG.requestTimeout);
 
-  const tasks = instances.map((base) => {
-    return (async () => {
-      const controller = new AbortController();
-      controllers.push(controller);
+      const res = await fetch(`${base}/api/v1/videos/${id}`, {
+        signal: ctrl.signal,
+      });
 
-      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      clearTimeout(t);
 
-      try {
-        const res = await fetch(buildUrl(base), { signal: controller.signal });
-        clearTimeout(timeout);
-
-        if (!res.ok) {
-          markInstanceBad(base);
-          throw new Error(`bad response ${res.status} from ${base}`);
-        }
-
-        const json = await res.json();
-        const parsed = parser(json);
-
-        if (!parsed) {
-          markInstanceBad(base);
-          throw new Error(`parse failed from ${base}`);
-        }
-
-        return { instance: base, data: parsed };
-      } catch (err) {
-        markInstanceBad(base);
-        throw err;
-      }
-    })();
-  });
-
-  try {
-    const result = await Promise.any(tasks);
-    controllers.forEach((c) => c.abort());
-    return result;
-  } catch {
-    controllers.forEach((c) => c.abort());
-    throw new Error('All instances failed');
-  }
-};
-
-const fetchFromInvidious = async (id) => {
-  const instances = rotateInstances(INVIDIOUS_INSTANCES);
-
-  const result = await fastestFetch(
-    instances,
-    (base) => `${base.replace(/\/$/, '')}/api/v1/videos/${id}`,
-    (data) => {
-      const formats = [];
-
-      if (Array.isArray(data.formatStreams)) {
-        data.formatStreams.forEach((f) => formats.push({ ...f, mimeType: f.type || f.mimeType }));
-      }
-      if (Array.isArray(data.adaptiveFormats)) {
-        data.adaptiveFormats.forEach((f) => formats.push({ ...f, mimeType: f.type || f.mimeType }));
-      }
-      if (Array.isArray(data.streamingData?.formats)) {
-        data.streamingData.formats.forEach((f) => formats.push(f));
+      if (!res.ok) {
+        markBad(base);
+        continue;
       }
 
-      const sd = { formats };
-      const is_live = Boolean(
-        data.liveNow || data.isLive || data.is_live || data.live || data.streamingData?.isLive
-      );
+      const data = await res.json();
 
-      return { streaming_data: sd, is_live, raw: data };
+      const formats = [
+        ...(data.formatStreams || []),
+        ...(data.adaptiveFormats || []),
+      ];
+
+      return {
+        provider: 'invidious',
+        instance: base,
+        formats,
+        raw: data,
+      };
+    } catch {
+      markBad(base);
     }
-  );
-
-  return {
-    provider: 'invidious',
-    instance: result.instance,
-    streaming_data: result.data.streaming_data,
-    is_live: result.data.is_live,
-    raw: result.data.raw,
-  };
-};
-
-// ------------------------
-// Normalization / selection
-// ------------------------
-const isValidVideoId = (id) => typeof id === 'string' && YT_ID_REGEX.test(id);
-
-const parseUrlFromFormat = (format) => {
-  if (!format) return null;
-  if (typeof format === 'string') return format;
-  if (format.url) return format.url;
-
-  const cipher = format.signatureCipher || format.signature_cipher || format.cipher;
-  if (!cipher) return null;
-
-  try {
-    return new URLSearchParams(cipher).get('url');
-  } catch {
-    return null;
   }
+
+  throw new Error('invidious failed');
 };
 
-const normalizeFormats = (sd = {}) => {
-  const list = [
-    ...(sd.formats || []),
-    ...(sd.adaptiveFormats || []),
-    ...(sd.adaptive_formats || []),
-    ...(sd.streamingData?.formats || []),
-  ];
+// =====================================================
+// Format normalization
+// =====================================================
+const isPlayable = (f) => {
+  if (!f) return false;
+  if (f.ext === 'mhtml') return false;
+  if (f.protocol === 'mhtml') return false;
 
-  return list.map((f) => ({
-    ...f,
-    mime: String(f.mimeType || f.mime_type || f.type || '').toLowerCase(),
+  const hasVideo = f.vcodec && f.vcodec !== 'none';
+  const hasAudio = f.acodec && f.acodec !== 'none';
+
+  return f.url && (hasVideo || hasAudio);
+};
+
+const normalizeFormats = (list = []) =>
+  list.filter(isPlayable).map((f) => ({
+    itag: f.format_id,
+    ext: f.ext,
+    resolution: f.resolution,
+    fps: f.fps,
+    acodec: f.acodec,
+    vcodec: f.vcodec,
+    url: f.url,
   }));
-};
 
-const selectBestVideo = (formats = []) =>
-  formats
-    .filter((f) => f.mime && f.mime.includes('video'))
-    .sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
-
-const selectBestAudio = (formats = []) =>
-  formats
-    .filter((f) => f.mime && f.mime.includes('audio'))
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
-
-const selectBestProgressive = (formats = []) =>
-  formats
-    .filter((f) => f.mime && f.mime.includes('video') && /mp4a|aac|opus/.test(f.mime))
-    .sort((a, b) => (b.height || 0) - (a.height || 0))[0] || null;
-
-const containsHlsFormat = (formats = []) =>
-  formats.some((f) => {
-    const url = parseUrlFromFormat(f) || '';
-    return (
-      url.includes('.m3u8') ||
-      (f.mime && f.mime.includes('mpegurl')) ||
-      /application\/vnd\.apple\.mpegurl/.test(f.mime || '')
-    );
-  });
-
-const hasManifestInSd = (sd = {}) =>
-  MANIFEST_KEYS.some((k) => Boolean(sd[k])) ||
-  MANIFEST_KEYS.some((k) => Boolean(sd.streamingData?.[k]));
-
-const extractTitle = (raw = {}) => {
-  return (
-    raw.title ||
-    raw.videoDetails?.title ||
-    raw.video_details?.title ||
-    raw.player_response?.videoDetails?.title ||
-    raw.basic_info?.title ||
-    raw.microformat?.title?.simpleText ||
-    raw.titleText?.runs?.map?.((x) => x.text).join('') ||
-    raw.video?.title ||
-    null
-  );
-};
-
-const isLiveLike = (raw = {}, sd = {}, formats = []) =>
-  Boolean(
-    raw.is_live ||
-    raw.live_status === 'is_live' ||
-    raw.liveNow ||
-    raw.isLive ||
-    raw.live ||
-    sd.isLive ||
-    hasManifestInSd(sd) ||
-    containsHlsFormat(formats)
-  );
-
-const buildSdFromRaw = (raw = {}) => {
-  const sd = {
-    formats: Array.isArray(raw.formats) ? raw.formats : [],
-  };
-
-  for (const key of MANIFEST_KEYS) {
-    if (raw[key]) sd[key] = raw[key];
-  }
-
-  if (raw.streamingData && typeof raw.streamingData === 'object') {
-    sd.streamingData = raw.streamingData;
-  }
-
-  return sd;
-};
-
-// ------------------------
-// Fetch order
-// yt-dlp(proxy) -> Invidious(non-live only) -> yt-dlp(direct)
-// ------------------------
-const fetchFromYtDlp = async (id, { useProxy = false } = {}) => {
-  const raw = await runYtDlp(id, { useProxy });
-  const sd = buildSdFromRaw(raw);
-  const is_live = isLiveLike(raw, sd, normalizeFormats(sd));
-
-  return {
-    provider: 'yt-dlp',
-    instance: useProxy ? (PROXY_URL || null) : null,
-    streaming_data: sd,
-    is_live,
-    raw,
-  };
-};
-
-const fetchStreamingInfo = async (id) => {
+// =====================================================
+// Fetch orchestration
+// =====================================================
+const fetchStreaming = async (id) => {
   if (PROXY_URL) {
     try {
-      return await fetchFromYtDlp(id, { useProxy: true });
-    } catch (e) {
-      console.warn('proxied yt-dlp failed, falling back to invidious:', e.message || e);
-    }
+      const r = await runYtDlp(id, { proxy: true });
+      return { source: 'yt-dlp-proxy', data: r };
+    } catch {}
   }
 
   try {
-    const invInfo = await fetchFromInvidious(id);
+    const r = await fetchInvidious(id);
+    return { source: 'invidious', data: r };
+  } catch {}
 
-    // Invidious は非ライブのみ採用
-    if (!invInfo.is_live && !isLiveLike(invInfo.raw, invInfo.streaming_data, normalizeFormats(invInfo.streaming_data))) {
-      return invInfo;
-    }
-
-    console.warn('Skipping Invidious result because it looks like live/manifest');
-  } catch (e) {
-    console.warn('invidious failed, falling back to direct yt-dlp:', e.message || e);
-  }
-
-  return fetchFromYtDlp(id, { useProxy: false });
+  const r = await runYtDlp(id, { proxy: false });
+  return { source: 'yt-dlp-direct', data: r };
 };
 
-// ------------------------
+// =====================================================
+// Response builder
+// =====================================================
+const buildResponse = (id, result) => {
+  if (result.source.startsWith('yt-dlp')) {
+    const formats = normalizeFormats(result.data.formats);
+
+    if (!formats.length) {
+      throw new Error('no playable formats');
+    }
+
+    return {
+      id,
+      title: result.data.title,
+      formats,
+      provider: result.source,
+    };
+  }
+
+  if (result.source === 'invidious') {
+    const formats = normalizeFormats(result.data.formats);
+
+    if (!formats.length) {
+      throw new Error('no playable formats');
+    }
+
+    return {
+      id,
+      title: result.data.raw.title,
+      formats,
+      provider: result.data.instance,
+    };
+  }
+
+  throw new Error('unknown source');
+};
+
+// =====================================================
 // API
-// ------------------------
-app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
+// =====================================================
+app.get('/api/stream', verifyAuth, async (req, res) => {
   try {
     const id = String(req.query.id || '');
     if (!id) return res.status(400).json({ error: 'id required' });
-    if (!isValidVideoId(id)) return res.status(400).json({ error: 'invalid video id' });
 
-    const info = await fetchStreamingInfo(id);
-    const sd = info.streaming_data || {};
-    const formats = normalizeFormats(sd);
+    const cached = getCache(id);
+    if (cached) return res.json(cached);
 
-    if (!formats.length && !hasManifestInSd(sd)) {
-      return res.status(404).json({ error: 'no stream' });
-    }
+    const result = await fetchStreaming(id);
+    const response = buildResponse(id, result);
 
-    const title = extractTitle(info.raw) || '';
-    const provider = {
-      name: info.provider || null,
-      url: info.instance || null,
-    };
+    setCache(id, response);
 
-    const manifestUrl = MANIFEST_KEYS.reduce((acc, k) => acc || sd[k] || sd.streamingData?.[k], null);
-    if (manifestUrl) {
-      return res.json({
-        resourcetype: 'hls',
-        title,
-        url: manifestUrl,
-        provider,
-      });
-    }
+    return res.json(response);
 
-    const hlsFormat = formats.find((f) => {
-      const url = parseUrlFromFormat(f) || '';
-      return (
-        url.includes('.m3u8') ||
-        (f.mime && f.mime.includes('mpegurl')) ||
-        /application\/vnd\.apple\.mpegurl/.test(f.mime || '')
-      );
-    });
-
-    if (hlsFormat) {
-      return res.json({
-        resourcetype: 'hls',
-        title,
-        url: parseUrlFromFormat(hlsFormat),
-        provider,
-      });
-    }
-
-    const progressive = selectBestProgressive(formats);
-    if (progressive) {
-      return res.json({
-        resourcetype: 'progressive',
-        title,
-        url: parseUrlFromFormat(progressive),
-        provider,
-      });
-    }
-
-    const video = selectBestVideo(formats);
-    const audio = selectBestAudio(formats);
-
-    if (video && audio) {
-      return res.json({
-        resourcetype: 'dash',
-        title,
-        videourl: parseUrlFromFormat(video),
-        audiourl: parseUrlFromFormat(audio),
-        provider,
-      });
-    }
-
-    return res.status(404).json({ error: 'no stream' });
   } catch (err) {
-    console.error('Unexpected error in /api/stream', err);
-    return res.status(500).json({ error: err?.message || 'internal error' });
+    console.error(err);
+    return res.status(500).json({
+      error: err.message || 'internal error',
+    });
   }
 });
 
-// ------------------------
-// Server start
-// ------------------------
-app.listen(port, () => console.log(`Server running on ${port}`));
+// =====================================================
+app.listen(port, () => {
+  console.log(`Server running on ${port}`);
+});
