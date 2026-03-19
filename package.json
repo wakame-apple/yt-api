@@ -8,12 +8,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "sudo apt-get update && sudo apt-get install -y ffmpeg python3 && sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && sudo chmod a+rx /usr/local/bin/yt-dlp"
-  }
+    "start": "node server.js"
+  },
   "dependencies": {
     "express": "^4.19.0",
-    "undici": "^6.0.0",
     "dotenv": "^16.4.5"
   }
 }
